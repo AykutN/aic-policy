@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aic_data_collector</name>
+  <version>0.1.0</version>
+  <description>CheatCode-tabanlı otomatik veri toplama policy'si</description>
+  <maintainer email="you@example.com">AIC Participant</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>aic_control_interfaces</depend>
+  <depend>aic_example_policies</depend>
+  <depend>aic_model</depend>
+  <depend>aic_model_interfaces</depend>
+  <depend>aic_task_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>python3-transforms3d</depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
