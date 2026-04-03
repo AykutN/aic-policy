@@ -57,8 +57,8 @@ class DataCollectorPolicy(Policy):
         # Uzman policy — ground truth TF ile çalışıyor
         self.cheat = CheatCode(parent_node)
 
-        # Kayıt dizinleri
-        self.save_dir = Path("/tmp/aic_dataset")
+        # Kayıt dizini
+        self.save_dir = Path.home() / "aic_dataset"
         self.log_dir = self.save_dir / "logs"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -162,6 +162,7 @@ class DataCollectorPolicy(Policy):
             ),
             "action_stiffness": stiffness_diag,  # (6,)
             "action_damping": damping_diag,        # (6,)
+            "action_gripper": np.array([current_gripper_pos], dtype=np.float32),
         }
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -282,7 +283,9 @@ class DataCollectorPolicy(Policy):
                         ),
 
                         # ── Action (CheatCode'un gönderdiği komut) ────────────
-                        **self._motion_update_to_action(motion_update),
+                        # Gripper bilgisini joint_pos'un 7. elemanından [6] alıyoruz.
+                        # Eğer dataset'ten model eğiteceksek gripper durumunu da vermemiz şart.
+                        **self._motion_update_to_action(motion_update, current_gripper_pos=obs.joint_states.position[6]),
 
                         # ── Timestamp ─────────────────────────────────────────
                         "timestamp": np.float64(time.time()),
@@ -407,6 +410,7 @@ class DataCollectorPolicy(Policy):
                     "action_quat",       # (T, 4)
                     "action_stiffness",  # (T, 6)
                     "action_damping",    # (T, 6)
+                    "action_gripper",    # (T, 1)
                 ):
                     act_g.create_dataset(
                         key, data=np.stack([step[key] for step in buffer])
