@@ -19,14 +19,56 @@ GPU           : NVIDIA T4 (16 GB VRAM) — Gazebo rendering + eğitim için şar
 
 ## ADIM 0 — Mac'te (Bağlanmadan Önce): Kodu AWS'e Gönder
 
-Önce local repo'yu commit et ve push'la. Sonra SSH ile AWS'e bağlan.
+Fork veya push'a gerek yok. AWS'de orijinal repo'yu clone'layıp,
+kendi eklediğimiz dosyaları scp ile direkt göndereceğiz.
+
+### 0a. AWS instance IP'sini öğren ve SSH erişimini doğrula
 
 ```bash
-# Mac'te çalıştır:
-cd /Users/y.aykut/Desktop/aic
-git add aic_data_collector/ pixi.toml
-git commit -m "feat: DataCollectorPolicy ve veri toplama paketi eklendi"
-git push
+# AWS Console → EC2 → Instances → Public IPv4 address kopyala
+AWS_IP="<buraya-aws-ip-yaz>"   # örnek: 54.123.45.67
+
+# Key dosyasının izinlerini ayarla (bir kez)
+chmod 400 ~/Desktop/aic-key.pem
+
+# Bağlantıyı test et
+ssh -i ~/Desktop/aic-key.pem ubuntu@$AWS_IP "echo 'SSH bağlantısı OK ✓'"
+```
+
+### 0b. AWS'de workspace hazırla (SSH ile gir, bir komut çalıştır)
+
+```bash
+ssh -i ~/Desktop/aic-key.pem ubuntu@$AWS_IP \
+  "mkdir -p ~/ws_aic/src && \
+   cd ~/ws_aic/src && \
+   git clone https://github.com/intrinsic-dev/aic && \
+   echo 'Repo clone edildi ✓'"
+```
+
+### 0c. Kendi kodlarımızı scp ile gönder
+
+```bash
+# Değişkeni hâlâ terminalde tutuyorsan:
+AWS_IP="<buraya-aws-ip-yaz>"
+
+# Eklediğimiz paket + config + kurulum rehberi
+scp -i ~/Desktop/aic-key.pem -r \
+  /Users/y.aykut/Desktop/aic/aic_data_collector \
+  ubuntu@$AWS_IP:~/ws_aic/src/aic/
+
+scp -i ~/Desktop/aic-key.pem \
+  /Users/y.aykut/Desktop/aic/pixi.toml \
+  /Users/y.aykut/Desktop/aic/AGENT_SETUP.md \
+  ubuntu@$AWS_IP:~/ws_aic/src/aic/
+
+echo "Transfer tamamlandı ✓"
+```
+
+### 0d. Transfer'i doğrula
+
+```bash
+ssh -i ~/Desktop/aic-key.pem ubuntu@$AWS_IP \
+  "ls ~/ws_aic/src/aic/aic_data_collector/ && echo 'Dosyalar geldi ✓'"
 ```
 
 ---
@@ -128,72 +170,115 @@ pixi run python3 -c "from aic_data_collector.ros.DataCollectorPolicy import Data
 
 ## ADIM 5 — Veri Toplama (Otomatik, ~2-3 Saat)
 
-İki terminal aç (veya tmux kullan):
+> **Önemli:** aic_engine README'ye göre her 3 trial sonunda "Completed" state'e geçip
+> duruyor. Bu yüzden her batch için eval container'ı da yeniden başlatmamız gerekiyor.
+> tmux ile iki pencereyi paralel yönetiyoruz.
 
-### Terminal 1 — Eval Container (ground_truth=true ile)
+### 5a. tmux kur ve oturum başlat
 
 ```bash
+# tmux kurula (genellikle Deep Learning AMI'de mevcut)
+which tmux || sudo apt-get install -y tmux
+
+# Kalıcı bir tmux oturumu başlat (SSH kesilse bile devam eder)
+tmux new-session -s aic
+# Ctrl+B, D ile detach edebilirsin. Geri dönmek için: tmux attach -t aic
+```
+
+### 5b. Tam Otomatik Batch Döngüsü (67 batch = ~200 episode)
+
+tmux içinde şu scripti çalıştır. Her batch için:
+1. eval container'ı başlatır (3 trial yapıp durur)
+2. DataCollectorPolicy'yi bağlar (3 episode kaydeder)
+3. Eval container'ı temizler
+4. Tekrar eder
+
+```bash
+cd ~/ws_aic/src/aic
 export DBX_CONTAINER_MANAGER=docker
-distrobox enter --root aic_eval -- /entrypoint.sh \
-  ground_truth:=true \
-  start_aic_engine:=true
-```
 
-### Terminal 2 — DataCollector Policy
+DATASET_DIR="/tmp/aic_dataset"
+N_BATCHES=67        # 67 batch × 3 episode = ~200 episode
+BATCH_TIMEOUT=360   # saniye (CheatCode ~30s/episode → 3 ep = ~90s + overhead)
 
-```bash
-cd ~/ws_aic/src/aic
+mkdir -p "$DATASET_DIR/logs"
 
-# DataCollectorPolicy'yi çalıştır
-# aic_engine otomatik olarak 3 trial yapıp kapanacak,
-# sonra yeniden başlatman gerekiyor (veya bir loop kullan).
+echo "=== VERİ TOPLAMA BAŞLIYOR: $N_BATCHES batch ==="
+echo "Başlangıç zamanı: $(date)"
 
-# TEK ÇALIŞTIRMA (3 episode = 3 trial):
-pixi run ros2 run aic_model aic_model \
-  --ros-args -p use_sim_time:=true \
-  -p policy:=aic_data_collector.ros.DataCollectorPolicy
+for i in $(seq 1 $N_BATCHES); do
+  START_TIME=$(date +%s)
+  EPISODES_BEFORE=$(ls "$DATASET_DIR"/episode_*.hdf5 2>/dev/null | wc -l)
 
-# Dataset'e bak:
-ls -lh /tmp/aic_dataset/
-pixi run python3 aic_data_collector/scripts/inspect_dataset.py /tmp/aic_dataset
-```
-
-### Terminal 2 — LOOP ile ~67 çalıştırma = ~200 episode
-
-```bash
-cd ~/ws_aic/src/aic
-
-for i in $(seq 1 67); do
   echo ""
-  echo "======================================="
-  echo "Çalıştırma $i / 67 (episode $((($i-1)*3+1))-$(($i*3)))"
-  echo "======================================="
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "BATCH $i / $N_BATCHES  |  Mevcut episode: $EPISODES_BEFORE"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  # Eval container'ın hazır olmasını bekle (30 sn)
-  sleep 30
+  # 1. Eval container'ı arka planda başlat
+  distrobox enter --root aic_eval -- /entrypoint.sh \
+    ground_truth:=true \
+    start_aic_engine:=true \
+    > "$DATASET_DIR/logs/eval_batch_$(printf '%04d' $i).log" 2>&1 &
+  EVAL_PID=$!
+  echo "  [1/3] Eval container başlatıldı (PID=$EVAL_PID), hazır olması bekleniyor..."
 
-  # DataCollector'ı çalıştır — aic_engine 3 trial yapıp bitince kapanır
-  timeout 300 pixi run ros2 run aic_model aic_model \
+  # 2. Eval container'ın hazır olmasını bekle (Gazebo + aic_engine)
+  sleep 45
+
+  # 3. DataCollectorPolicy'yi çalıştır (3 episode kaydeder ve çıkar)
+  echo "  [2/3] DataCollectorPolicy başlatılıyor..."
+  timeout $BATCH_TIMEOUT pixi run ros2 run aic_model aic_model \
     --ros-args -p use_sim_time:=true \
     -p policy:=aic_data_collector.ros.DataCollectorPolicy
+  DC_EXIT=$?
 
-  echo "Çalıştırma $i tamamlandı."
-  echo "Şu anki dataset:"
-  ls /tmp/aic_dataset/ | wc -l
-  du -sh /tmp/aic_dataset/
+  # 4. Eval container'ı durdur ve temizle
+  echo "  [3/3] Eval container durduruluyor..."
+  kill $EVAL_PID 2>/dev/null
+  distrobox stop --root aic_eval 2>/dev/null || true
+  sleep 5
 
-  # Eval container yeniden başlatıldıktan sonra hazır olması için bekle
+  # 5. Sonuç raporu
+  EPISODES_AFTER=$(ls "$DATASET_DIR"/episode_*.hdf5 2>/dev/null | wc -l)
+  NEW_EPS=$((EPISODES_AFTER - EPISODES_BEFORE))
+  END_TIME=$(date +%s)
+  ELAPSED=$((END_TIME - START_TIME))
+
+  echo ""
+  echo "  ✓ Batch $i tamamlandı:"
+  echo "    Yeni episode: $NEW_EPS  |  Toplam: $EPISODES_AFTER  |  Süre: ${ELAPSED}s"
+  du -sh "$DATASET_DIR" | awk '{print "    Disk: " $1}'
+
+  # DataCollector timeout olduysa (3 episode gelmedi) — uyar ama devam et
+  if [ $DC_EXIT -eq 124 ]; then
+    echo "  ⚠ UYARI: Batch $i timeout oldu! Log: $DATASET_DIR/logs/eval_batch_$(printf '%04d' $i).log"
+  fi
+
+  # Sonraki batch için kısa bekleme (Zenoh bağlantı temizliği)
   sleep 10
 done
 
 echo ""
-echo "=== VERİ TOPLAMA TAMAMLANDI ==="
-pixi run python3 aic_data_collector/scripts/inspect_dataset.py /tmp/aic_dataset
+echo "╔══════════════════════════════════════════╗"
+echo "║     VERİ TOPLAMA TAMAMLANDI ✓            ║"
+echo "╚══════════════════════════════════════════╝"
+echo "Bitiş zamanı: $(date)"
+echo ""
+pixi run python3 aic_data_collector/scripts/inspect_dataset.py "$DATASET_DIR"
 ```
 
-> **NOT:** Her "çalıştırma"da eval container zaten çalışıyor olmalı (Terminal 1).
-> aic_engine her run'da 3 trial yapar ve otomatik reset eder.
-> Terminal 1'deki eval container'ı 67 çalıştırma boyunca kapalı tutma.
+### 5c. Anlık İzleme (Ayrı bir SSH bağlantısından)
+
+```bash
+# Yeni terminal/SSH ile bağlanarak ilerlemeyi izle:
+watch -n 10 'echo "=== Dataset ===" && \
+  ls /tmp/aic_dataset/episode_*.hdf5 2>/dev/null | wc -l && \
+  du -sh /tmp/aic_dataset/ && \
+  echo "" && \
+  echo "=== Son log satırları ===" && \
+  ls -t /tmp/aic_dataset/logs/run_*.log 2>/dev/null | head -1 | xargs tail -5 2>/dev/null'
+```
 
 ---
 
@@ -210,9 +295,8 @@ ls -lh aic_dataset_*.tar.gz
 # Seçenek B: AWS S3 (bucket önceden oluşturulmuş olmalı)
 # aws s3 cp /tmp/aic_dataset_$(date +%Y%m%d).tar.gz s3://your-bucket/
 
-# Seçenek C: Dataset'i Mac'e indir (SCP)
-# Yerel terminalde:
-# scp -i key.pem ubuntu@<aws-ip>:/tmp/aic_dataset_*.tar.gz ~/Desktop/
+# Seçenek C: Dataset'i Mac'e indir (SCP — yerel Mac terminalinde çalıştır)
+# scp -i ~/Desktop/aic-key.pem ubuntu@<aws-ip>:/tmp/aic_dataset_*.tar.gz ~/Desktop/
 ```
 
 ---
