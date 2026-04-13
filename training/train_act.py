@@ -31,13 +31,14 @@ def s3_sync(local: str, s3: str):
     subprocess.run(["aws", "s3", "sync", local, s3, "--quiet"], check=False)
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, path: Path):
+def save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "val_loss": val_loss,
+        "patience_counter": patience_counter,
     }, path)
 
 
@@ -79,7 +80,8 @@ def train(args):
         optimizer.load_state_dict(ckpt["optimizer_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
-        print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+        patience_counter = ckpt.get("patience_counter", 0)
+        print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
 
     train_ds = AICDataset(
         args.dataset, subtask=args.subtask,
@@ -135,15 +137,15 @@ def train(args):
                 ft = batch["ft"].to(device)
                 actions = batch["actions"].to(device)
                 pred, mu, log_var = model(images, proprio, ft, actions)
-                val_loss += act_loss(pred, actions, mu, log_var).item()
+                val_loss += act_loss(pred, actions, mu, log_var, kl_weight=tc.get("kl_weight", 0.1)).item()
         val_loss /= len(val_loader)
 
         print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
 
         # --- Checkpoint ---
         ckpt_path = checkpoint_dir / f"epoch_{epoch:04d}.pt"
-        save_checkpoint(model, optimizer, epoch, val_loss, ckpt_path)
-        save_checkpoint(model, optimizer, epoch, val_loss, latest_ckpt)
+        save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, ckpt_path)
+        save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, latest_ckpt)
 
         # S3 sync every N epochs
         if (epoch + 1) % tc["s3_sync_every_n"] == 0:
@@ -154,7 +156,7 @@ def train(args):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, checkpoint_dir / "best.pt")
+            save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, checkpoint_dir / "best.pt")
         else:
             patience_counter += 1
             if patience_counter >= tc["early_stopping_patience"]:
