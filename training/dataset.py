@@ -65,7 +65,7 @@ class AICDataset(Dataset):
             # Valid indices: need To_prop steps of history AND Tp steps of future
             # AND must belong to the requested subtask
             lookback = max(obs_window_image, obs_window_proprio)
-            for t in range(lookback, T - action_chunk):
+            for t in range(lookback, T - action_chunk + 1):
                 if subtask_arr[t] == subtask:
                     self._index.append((ep_path, t))
 
@@ -74,7 +74,7 @@ class AICDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         ep_path, t = self._index[idx]
-        with h5py.File(ep_path, "r") as f:
+        with h5py.File(ep_path, "r", swmr=True) as f:
             obs = f["observations"]
             act = f["actions"]
 
@@ -124,18 +124,23 @@ class AICDataset(Dataset):
         }
 
     def _augment(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Random crop + color jitter per timestep."""
-        To, n_cams, C, H, W = imgs.shape
+        """Color jitter with consistent parameters across all cameras and timesteps."""
         brightness, contrast, saturation, hue = 0.2, 0.2, 0.2, 0.05
+        # Sample once per sample — same lighting perturbation for all cameras and timesteps
+        b = 1 + (torch.rand(1).item() - 0.5) * 2 * brightness
+        c = 1 + (torch.rand(1).item() - 0.5) * 2 * contrast
+        s = 1 + (torch.rand(1).item() - 0.5) * 2 * saturation
+        h = (torch.rand(1).item() - 0.5) * 2 * hue
+        To, n_cams, C, H, W = imgs.shape
         out = []
         for t in range(To):
             frame_cams = []
-            for c in range(n_cams):
-                img = imgs[t, c]  # (C, H, W)
-                img = TF.adjust_brightness(img, 1 + (torch.rand(1).item() - 0.5) * 2 * brightness)
-                img = TF.adjust_contrast(img, 1 + (torch.rand(1).item() - 0.5) * 2 * contrast)
-                img = TF.adjust_saturation(img, 1 + (torch.rand(1).item() - 0.5) * 2 * saturation)
-                img = TF.adjust_hue(img, (torch.rand(1).item() - 0.5) * 2 * hue)
+            for cam in range(n_cams):
+                img = imgs[t, cam]
+                img = TF.adjust_brightness(img, b)
+                img = TF.adjust_contrast(img, c)
+                img = TF.adjust_saturation(img, s)
+                img = TF.adjust_hue(img, h)
                 frame_cams.append(img)
             out.append(torch.stack(frame_cams))
         return torch.stack(out)
