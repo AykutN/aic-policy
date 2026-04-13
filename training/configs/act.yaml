@@ -1,0 +1,28 @@
+# ACT hyperparameters
+model:
+  image_feature_dim: 512      # ResNet-18 output per camera
+  ft_feature_dim: 128         # 1D-CNN output
+  proprio_feature_dim: 64     # Linear projection output
+  transformer_dim: 256
+  transformer_heads: 4
+  transformer_layers: 4
+  latent_dim: 32              # CVAE latent
+  action_dim: 20              # 3+4+6+6+1
+  action_chunk: 32            # Tp
+
+data:
+  obs_window_image: 4         # To for RGB (200ms)
+  obs_window_proprio: 16      # To for F/T + proprio (800ms)
+  train_val_split: 0.9        # episode-level
+  image_size: [256, 288]      # H x W after scale (IMAGE_SCALE=0.25)
+
+training:
+  batch_size: 32
+  lr: 1e-4
+  weight_decay: 1e-4
+  epochs: 200
+  early_stopping_patience: 20
+  checkpoint_every_n: 1       # save to EBS every epoch
+  s3_sync_every_n: 5          # sync to S3 every N epochs
+  s3_bucket: "s3://aic-yusuf/checkpoints"
+  checkpoint_dir: "~/checkpoints"

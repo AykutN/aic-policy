@@ -1,0 +1,28 @@
+# CFM hyperparameters (inherits same encoder config as act.yaml)
+model:
+  image_feature_dim: 512
+  ft_feature_dim: 128
+  proprio_feature_dim: 64
+  fusion_dim: 256
+  flow_hidden_dim: 512        # MLP hidden dim for flow network
+  flow_layers: 6
+  action_dim: 20
+  action_chunk: 32
+
+data:
+  obs_window_image: 4
+  obs_window_proprio: 16
+  train_val_split: 0.9
+  image_size: [256, 288]
+
+training:
+  batch_size: 32
+  lr: 1e-4
+  weight_decay: 1e-4
+  epochs: 200
+  early_stopping_patience: 20
+  checkpoint_every_n: 1
+  s3_sync_every_n: 5
+  s3_bucket: "s3://aic-yusuf/checkpoints"
+  checkpoint_dir: "~/checkpoints"
+  n_flow_steps: 10            # ODE integration steps at inference
