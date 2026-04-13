@@ -81,6 +81,8 @@ def train(args):
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
         patience_counter = ckpt.get("patience_counter", 0)
+        for _ in range(start_epoch):
+            scheduler.step()
         print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
 
     train_ds = AICDataset(

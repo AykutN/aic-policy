@@ -87,10 +87,10 @@ def _obs_msg_to_dict(obs) -> dict:
     }
 
 
-def _buffer_to_tensors(obs_buffer: list, device):
+def _buffer_to_tensors(obs_buffer: list, to_img: int, to_prop: int, device):
     """Convert rolling observation buffer to (images, proprio, ft) tensors."""
-    To_img = OBS_WINDOW_IMAGE
-    To_prop = OBS_WINDOW_PROPRIO
+    To_img = to_img
+    To_prop = to_prop
 
     img_buf = obs_buffer[-To_img:]
     imgs = np.stack([[o["left_image"], o["center_image"], o["right_image"]] for o in img_buf])
@@ -151,6 +151,8 @@ class TrainedPolicy(Policy):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         cfg = _load_yaml(str(Path(__file__).parent / "configs" / "act.yaml"))
+        self._obs_window_image = cfg["data"]["obs_window_image"]
+        self._obs_window_proprio = cfg["data"]["obs_window_proprio"]
 
         approach_ckpt = parent_node.declare_parameter("approach_ckpt", "").value
         insert_ckpt = parent_node.declare_parameter("insert_ckpt", "").value
@@ -170,7 +172,7 @@ class TrainedPolicy(Policy):
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
-        lookback = max(OBS_WINDOW_IMAGE, OBS_WINDOW_PROPRIO)
+        lookback = max(self._obs_window_image, self._obs_window_proprio)
         obs_buffer = []
 
         # Warm up buffer with initial observations
@@ -183,7 +185,7 @@ class TrainedPolicy(Policy):
         while step < MAX_STEPS:
             if not action_queue:
                 model = self.approach_model if step < APPROACH_STEPS else self.insert_model
-                imgs, proprio, ft = _buffer_to_tensors(obs_buffer, self.device)
+                imgs, proprio, ft = _buffer_to_tensors(obs_buffer, self._obs_window_image, self._obs_window_proprio, self.device)
                 with torch.no_grad():
                     pred, _, _ = model(imgs, proprio, ft, actions_gt=None)
                 action_queue = pred[0].cpu().numpy().tolist()
