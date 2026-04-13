@@ -10,13 +10,14 @@ model:
   action_chunk: 32
 
 data:
-  obs_window_image: 4
-  obs_window_proprio: 16
+  control_hz: 20              # dataset collected at 20Hz
+  obs_window_image: 4         # 4 steps = 200ms at 20Hz
+  obs_window_proprio: 16      # 16 steps = 800ms at 20Hz
   train_val_split: 0.9
   image_size: [256, 288]
 
 training:
-  batch_size: 32
+  batch_size: 16              # T4 16GB safe with 3-cam 4-frame input
   lr: 1e-4
   weight_decay: 1e-4
   epochs: 200
@@ -25,4 +26,6 @@ training:
   s3_sync_every_n: 5
   s3_bucket: "s3://aic-yusuf/checkpoints"
   checkpoint_dir: "~/checkpoints"
-  n_flow_steps: 10            # ODE integration steps at inference
+
+inference:
+  n_flow_steps: 10            # ODE integration steps (inference only, not used during training)
