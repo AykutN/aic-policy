@@ -103,7 +103,7 @@ class ACTPolicy(nn.Module):
         memory = torch.cat([obs_token, latent_token], dim=1)   # (B, 2, D)
 
         # Action query tokens
-        queries = self.action_queries.weight.unsqueeze(0).expand(B, -1, -1)  # (B, Tp, D)
+        queries = self.action_queries.weight.unsqueeze(0).expand(B, -1, -1).contiguous()  # (B, Tp, D)
 
         # Decode
         out = self.transformer(queries, memory)     # (B, Tp, D)
@@ -115,11 +115,12 @@ class ACTPolicy(nn.Module):
 def act_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    mu: torch.Tensor,
-    log_var: torch.Tensor,
+    mu: "torch.Tensor | None",
+    log_var: "torch.Tensor | None",
     kl_weight: float = 0.1,
 ) -> torch.Tensor:
-    """L1 reconstruction + KL divergence."""
+    """L1 reconstruction + KL divergence. mu and log_var must not be None (training only)."""
+    assert mu is not None and log_var is not None, "act_loss requires mu/log_var (call only during training)"
     recon_loss = F.l1_loss(pred, target)
     kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
     return recon_loss + kl_weight * kl_loss
