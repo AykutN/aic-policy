@@ -81,7 +81,7 @@ def _obs_msg_to_dict(obs) -> dict:
         "tcp_error": np.array(obs.tcp_error, dtype=np.float32),
         "joint_pos": np.array(obs.joint_states.position[:7], dtype=np.float32),
         "joint_vel": np.array(obs.joint_states.velocity[:7], dtype=np.float32),
-        "gripper_pos": np.float32(obs.joint_states.position[6]),
+        "gripper_pos": np.float32(obs.joint_states.position[7]),
         "wrench_force": np.array([obs.wrench.force.x, obs.wrench.force.y, obs.wrench.force.z], dtype=np.float32),
         "wrench_torque": np.array([obs.wrench.torque.x, obs.wrench.torque.y, obs.wrench.torque.z], dtype=np.float32),
     }
@@ -150,7 +150,7 @@ class TrainedPolicy(Policy):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        cfg = _load_yaml("training/configs/act.yaml")
+        cfg = _load_yaml(str(Path(__file__).parent / "configs" / "act.yaml"))
 
         approach_ckpt = parent_node.declare_parameter("approach_ckpt", "").value
         insert_ckpt = parent_node.declare_parameter("insert_ckpt", "").value
