@@ -18,12 +18,13 @@ data:
   image_size: [256, 288]      # H x W after scale (IMAGE_SCALE=0.25)
 
 training:
-  batch_size: 16              # T4 16GB safe with 3-cam 4-frame input; increase if memory allows
+  batch_size: 32              # AMP enabled — safe on 4070S 12GB
   lr: 1e-4
   weight_decay: 1e-4
   epochs: 200
   early_stopping_patience: 20
-  checkpoint_every_n: 1       # save to EBS every epoch
+  num_workers: 12             # 5950X 16-core; leave 4 for OS + main process
+  checkpoint_every_n: 1       # save every epoch
   s3_sync_every_n: 5          # sync to S3 every N epochs
   s3_bucket: "s3://aic-yusuf/checkpoints"
   checkpoint_dir: "~/checkpoints"

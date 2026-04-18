@@ -130,7 +130,7 @@ class DataCollectorPolicy(Policy):
             )
         return img
 
-    def _motion_update_to_action(self, mu: MotionUpdate) -> dict:
+    def _motion_update_to_action(self, mu: MotionUpdate, current_gripper_pos: float) -> dict:
         """MotionUpdate mesajından action vektörlerini çıkarır."""
         # Stiffness ve damping: 6×6 tam matris → sadece köşegen alınır (6D)
         stiffness_diag = (
@@ -162,6 +162,10 @@ class DataCollectorPolicy(Policy):
             ),
             "action_stiffness": stiffness_diag,  # (6,)
             "action_damping": damping_diag,        # (6,)
+            # CheatCode does not issue gripper commands (MotionUpdate has no gripper
+            # field). The gripper is held constant throughout insertion (cable is
+            # pre-grasped). Recording the current position is therefore equivalent
+            # to the effective command: "maintain this position."
             "action_gripper": np.array([current_gripper_pos], dtype=np.float32),
         }
 
@@ -191,6 +195,12 @@ class DataCollectorPolicy(Policy):
         # Bu episode için adım tamponu
         buffer: list[dict] = []
         step_errors = 0
+        # CheatCode subtask sınırı: ilk 100 adım APPROACH, sonrası INSERT.
+        # Bu bilgi CheatCode.insert_cable() kaynak kodundan türetilmiştir:
+        #   for t in range(0, 100): → APPROACH
+        #   while True:             → INSERT
+        APPROACH_STEPS = 100
+        step_count = 0
 
         # ── Recording wrapper ─────────────────────────────────────────────────
         def recording_move_robot(
@@ -198,7 +208,8 @@ class DataCollectorPolicy(Policy):
             joint_motion_update=None,
         ) -> None:
             """Orijinal move_robot'u sararak her çağrıda observation+action kaydeder."""
-            nonlocal step_errors
+            nonlocal step_errors, step_count
+            step_count += 1
 
             obs = get_observation()
 
@@ -213,12 +224,18 @@ class DataCollectorPolicy(Policy):
                         "right_image":  self._ros_img_to_numpy(obs.right_image),
 
                         # ── Joint states ──────────────────────────────────────
-                        # joint_states.position[:7] = 6 arm joints + 1 gripper
+                        # joint_states.position[:6] = 6 arm joints
+                        # joint_states.position[6]  = gripper (stored separately below)
                         "joint_pos": np.array(
                             obs.joint_states.position[:7], dtype=np.float32
                         ),
                         "joint_vel": np.array(
                             obs.joint_states.velocity[:7], dtype=np.float32
+                        ),
+                        # Gripper state as an explicit observation input so the
+                        # policy can condition on it at inference time.
+                        "gripper_pos": np.array(
+                            [obs.joint_states.position[6]], dtype=np.float32
                         ),
 
                         # ── TCP pose ──────────────────────────────────────────
@@ -282,9 +299,29 @@ class DataCollectorPolicy(Policy):
                             dtype=np.float32,
                         ),
 
+                        # ── Subtask marker ────────────────────────────────────
+                        # 0 = APPROACH (adım 1-100), 1 = INSERT (adım 101+)
+                        # Eğitimde veriyi bölmek veya subtask-conditioned model
+                        # için kullanılır.
+                        "subtask": np.int8(0 if step_count <= APPROACH_STEPS else 1),
+
+                        # ── Task conditioning (per-step, constant within episode) ──
+                        # Stored per step so every row is self-contained for the
+                        # dataloader — no need to join with file-level attributes.
+                        # plug_type: 0 = SFP, 1 = SC, -1 = unknown
+                        "plug_type": np.int8(
+                            0 if "sfp" in task.plug_name.lower()
+                            else 1 if "sc" in task.plug_name.lower()
+                            else -1
+                        ),
+                        # port_id: trailing integer of port_name (e.g. "sfp_port_2" → 2)
+                        "port_id": np.int8(
+                            int(task.port_name.rsplit("_", 1)[-1])
+                            if task.port_name.rsplit("_", 1)[-1].isdigit()
+                            else -1
+                        ),
+
                         # ── Action (CheatCode'un gönderdiği komut) ────────────
-                        # Gripper bilgisini joint_pos'un 7. elemanından [6] alıyoruz.
-                        # Eğer dataset'ten model eğiteceksek gripper durumunu da vermemiz şart.
                         **self._motion_update_to_action(motion_update, current_gripper_pos=obs.joint_states.position[6]),
 
                         # ── Timestamp ─────────────────────────────────────────
@@ -388,15 +425,19 @@ class DataCollectorPolicy(Policy):
 
                 # Sayısal state vektörleri
                 for key in (
-                    "joint_pos",     # (T, 7)
+                    "joint_pos",     # (T, 7)  — 6 arm joints + gripper
                     "joint_vel",     # (T, 7)
+                    "gripper_pos",   # (T, 1)  — explicit gripper observation
                     "tcp_pos",       # (T, 3)
                     "tcp_quat",      # (T, 4)
                     "tcp_vel_lin",   # (T, 3)
                     "tcp_vel_ang",   # (T, 3)
-                    "tcp_error",     # (T, 6) — RunACT'te de kullanılan
+                    "tcp_error",     # (T, 6)
                     "wrench_force",  # (T, 3)
                     "wrench_torque", # (T, 3)
+                    "subtask",       # (T,)    — 0=APPROACH, 1=INSERT
+                    "plug_type",     # (T,)    — 0=SFP, 1=SC
+                    "port_id",       # (T,)    — port index
                     "timestamp",     # (T,)
                 ):
                     obs_g.create_dataset(

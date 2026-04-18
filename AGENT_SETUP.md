@@ -197,7 +197,8 @@ tmux içinde şu scripti çalıştır. Her batch için:
 cd ~/ws_aic/src/aic
 export DBX_CONTAINER_MANAGER=docker
 
-DATASET_DIR="/tmp/aic_dataset"
+DATASET_DIR="$HOME/aic_dataset"   # $HOME = EBS, /tmp değil — spot stop'ta korunur
+S3_BUCKET="s3://aic-yusuf/aic_dataset"
 N_BATCHES=67        # 67 batch × 3 episode = ~200 episode
 BATCH_TIMEOUT=360   # saniye (CheatCode ~30s/episode → 3 ep = ~90s + overhead)
 
@@ -255,6 +256,13 @@ for i in $(seq 1 $N_BATCHES); do
     echo "  ⚠ UYARI: Batch $i timeout oldu! Log: $DATASET_DIR/logs/eval_batch_$(printf '%04d' $i).log"
   fi
 
+  # 6. S3'e sync — spot terminate olsa bile veri kaybolmaz
+  echo "  S3 sync başlıyor..."
+  aws s3 sync "$DATASET_DIR/" "$S3_BUCKET/" \
+    --exclude "logs/*" \
+    && echo "  S3 sync tamamlandı ✓ ($S3_BUCKET)" \
+    || echo "  ⚠ S3 SYNC HATASI! IAM rolünü kontrol et: aws s3 ls s3://aic-yusuf/"
+
   # Sonraki batch için kısa bekleme (Zenoh bağlantı temizliği)
   sleep 10
 done
@@ -273,30 +281,43 @@ pixi run python3 aic_data_collector/scripts/inspect_dataset.py "$DATASET_DIR"
 ```bash
 # Yeni terminal/SSH ile bağlanarak ilerlemeyi izle:
 watch -n 10 'echo "=== Dataset ===" && \
-  ls /tmp/aic_dataset/episode_*.hdf5 2>/dev/null | wc -l && \
-  du -sh /tmp/aic_dataset/ && \
+  ls ~/aic_dataset/episode_*.hdf5 2>/dev/null | wc -l && \
+  du -sh ~/aic_dataset/ && \
   echo "" && \
   echo "=== Son log satırları ===" && \
-  ls -t /tmp/aic_dataset/logs/run_*.log 2>/dev/null | head -1 | xargs tail -5 2>/dev/null'
+  ls -t ~/aic_dataset/logs/run_*.log 2>/dev/null | head -1 | xargs tail -5 2>/dev/null'
 ```
 
 ---
 
-## ADIM 6 — Dataset'i Sakla
+## ADIM 6 — Dataset'i Sakla / Spot Terminate Sonrası Resume
 
-Veri toplama bittikten sonra dataset'i S3'e yükle veya tar.gz ile sakla:
+Batch döngüsü her episode'dan sonra S3'e sync yaptığı için veri zaten güvende.
+Bu adım final yükleme veya yeni instance'ta resume için kullanılır.
 
 ```bash
-# Seçenek A: tar.gz
-cd /tmp
-tar -czf aic_dataset_$(date +%Y%m%d).tar.gz aic_dataset/
-ls -lh aic_dataset_*.tar.gz
+# Final S3 yüklemesi (batch script bitmişse)
+aws s3 sync ~/aic_dataset/ s3://aic-yusuf/aic_dataset/ --exclude "logs/*"
 
-# Seçenek B: AWS S3 (bucket önceden oluşturulmuş olmalı)
-# aws s3 cp /tmp/aic_dataset_$(date +%Y%m%d).tar.gz s3://your-bucket/
+# Dataset'i Mac'e indir (Mac terminalinde çalıştır)
+scp -i ~/Desktop/aic-key.pem \
+  ubuntu@<aws-ip>:~/aic_dataset/summary.jsonl ~/Desktop/
+# Tüm dataset için (büyük olabilir):
+# aws s3 sync s3://aic-yusuf/aic_dataset/ ~/Desktop/aic_dataset/
+```
 
-# Seçenek C: Dataset'i Mac'e indir (SCP — yerel Mac terminalinde çalıştır)
-# scp -i ~/Desktop/aic-key.pem ubuntu@<aws-ip>:/tmp/aic_dataset_*.tar.gz ~/Desktop/
+### Spot Terminate Sonrası Yeni Instance'ta Resume
+
+```bash
+# 1. Yeni instance'ta kurulum tamamlandıktan sonra (Adım 1-4 tekrar):
+
+# 2. S3'ten veriyi geri al
+aws s3 sync s3://aic-yusuf/aic_dataset/ ~/aic_dataset/
+echo "Kaç episode var: $(ls ~/aic_dataset/episode_*.hdf5 2>/dev/null | wc -l)"
+
+# 3. Batch script'i olduğu gibi başlat — policy kaldığı yerden devam eder.
+# DataCollectorPolicy __init__'te mevcut .hdf5 sayısını sayar ve
+# episode_count'u otomatik ayarlar. Üzerine yazmaz.
 ```
 
 ---
@@ -305,13 +326,13 @@ ls -lh aic_dataset_*.tar.gz
 
 ```bash
 cd ~/ws_aic/src/aic
-pixi run python3 aic_data_collector/scripts/inspect_dataset.py /tmp/aic_dataset
+pixi run python3 aic_data_collector/scripts/inspect_dataset.py ~/aic_dataset
 ```
 
 Beklenen çıktı:
 ```
 ============================================================
-Dataset: /tmp/aic_dataset
+Dataset: /home/ubuntu/aic_dataset
 Toplam episode: 200
 ============================================================
 

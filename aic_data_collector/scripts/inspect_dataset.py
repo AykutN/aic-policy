@@ -69,7 +69,7 @@ def inspect(dataset_dir: str):
     print(f"Ep başına orta.: {human_size(total_bytes // len(episodes))}")
     print(f"Toplam tahmini (200 ep): {human_size(total_bytes // len(episodes) * 200)}\n")
 
-    # İlk episode detayı
+    # İlk episode detayı + alan doğrulama
     print(f"{'─'*60}")
     print("İlk episode detayı:")
     with h5py.File(episodes[0], "r") as f:
@@ -86,6 +86,33 @@ def inspect(dataset_dir: str):
         print(f"  action_pos:    {act['action_pos'].shape}")
         print(f"  action_quat:   {act['action_quat'].shape}")
         print(f"  stiffness:     {act['action_stiffness'].shape}")
+
+    # Beklenen alan listesi — eksik olan varsa uyar
+    print(f"\n{'─'*60}")
+    print("Alan doğrulama:")
+    expected_obs = [
+        "left_image", "center_image", "right_image",
+        "joint_pos", "joint_vel", "gripper_pos",
+        "tcp_pos", "tcp_quat", "tcp_vel_lin", "tcp_vel_ang", "tcp_error",
+        "wrench_force", "wrench_torque",
+        "subtask", "plug_type", "port_id", "timestamp",
+    ]
+    expected_act = ["action_pos", "action_quat", "action_stiffness", "action_damping", "action_gripper"]
+    all_ok = True
+    with h5py.File(episodes[0], "r") as f:
+        for key in expected_obs:
+            if key in f["observations"]:
+                print(f"  obs/{key:<20} OK  {f['observations'][key].shape}")
+            else:
+                print(f"  obs/{key:<20} *** EKSIK ***")
+                all_ok = False
+        for key in expected_act:
+            if key in f["actions"]:
+                print(f"  act/{key:<20} OK  {f['actions'][key].shape}")
+            else:
+                print(f"  act/{key:<20} *** EKSIK ***")
+                all_ok = False
+    print(f"\n{'Alan kontrolü: TAMAM ✓' if all_ok else '⚠ EKSİK ALANLAR VAR — veri toplama kodunu kontrol et!'}")
 
 
 if __name__ == "__main__":

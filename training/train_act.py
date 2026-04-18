@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import yaml
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from training.dataset import AICDataset
@@ -31,12 +32,13 @@ def s3_sync(local: str, s3: str):
     subprocess.run(["aws", "s3", "sync", local, s3, "--quiet"], check=False)
 
 
-def save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, path: Path):
+def save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "scaler_state": scaler.state_dict(),
         "val_loss": val_loss,
         "patience_counter": patience_counter,
     }, path)
@@ -69,6 +71,7 @@ def train(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tc["epochs"])
+    scaler = GradScaler("cuda")
 
     start_epoch = 0
     best_val_loss = float("inf")
@@ -78,6 +81,8 @@ def train(args):
         ckpt = torch.load(latest_ckpt, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "scaler_state" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state"])
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
         patience_counter = ckpt.get("patience_counter", 0)
@@ -103,10 +108,11 @@ def train(args):
     )
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
+    nw = tc.get("num_workers", 8)
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
-                              num_workers=4, pin_memory=True)
+                              num_workers=nw, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
-                            num_workers=4, pin_memory=True)
+                            num_workers=nw, pin_memory=True, persistent_workers=True)
 
     for epoch in range(start_epoch, tc["epochs"]):
         # --- Train ---
@@ -119,11 +125,14 @@ def train(args):
             actions = batch["actions"].to(device)
 
             optimizer.zero_grad()
-            pred, mu, log_var = model(images, proprio, ft, actions)
-            loss = act_loss(pred, actions, mu, log_var, kl_weight=0.1)
-            loss.backward()
+            with autocast("cuda"):
+                pred, mu, log_var = model(images, proprio, ft, actions)
+                loss = act_loss(pred, actions, mu, log_var, kl_weight=0.1)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item()
 
         train_loss /= len(train_loader)
@@ -138,16 +147,17 @@ def train(args):
                 proprio = batch["proprio"].to(device)
                 ft = batch["ft"].to(device)
                 actions = batch["actions"].to(device)
-                pred, mu, log_var = model(images, proprio, ft, actions)
-                val_loss += act_loss(pred, actions, mu, log_var, kl_weight=tc.get("kl_weight", 0.1)).item()
+                with autocast("cuda"):
+                    pred, mu, log_var = model(images, proprio, ft, actions)
+                    val_loss += act_loss(pred, actions, mu, log_var, kl_weight=tc.get("kl_weight", 0.1)).item()
         val_loss /= len(val_loader)
 
         print(f"Epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
 
         # --- Checkpoint ---
         ckpt_path = checkpoint_dir / f"epoch_{epoch:04d}.pt"
-        save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, ckpt_path)
-        save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, latest_ckpt)
+        save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, ckpt_path)
+        save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, latest_ckpt)
 
         # S3 sync every N epochs
         if (epoch + 1) % tc["s3_sync_every_n"] == 0:
@@ -158,7 +168,7 @@ def train(args):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, epoch, val_loss, patience_counter, checkpoint_dir / "best.pt")
+            save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, checkpoint_dir / "best.pt")
         else:
             patience_counter += 1
             if patience_counter >= tc["early_stopping_patience"]:
