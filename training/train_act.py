@@ -111,10 +111,13 @@ def train(args):
     nw = tc.get("num_workers", 4)
     pw = nw > 0
     pm = nw > 0
+    mp_ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
-                              num_workers=nw, pin_memory=pm, persistent_workers=pw)
+                              num_workers=nw, pin_memory=pm, persistent_workers=pw,
+                              multiprocessing_context=mp_ctx)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
-                            num_workers=nw, pin_memory=pm, persistent_workers=pw)
+                            num_workers=nw, pin_memory=pm, persistent_workers=pw,
+                            multiprocessing_context=mp_ctx)
 
     for epoch in range(start_epoch, tc["epochs"]):
         # --- Train ---
