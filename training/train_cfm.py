@@ -105,11 +105,12 @@ def train(args):
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    nw = tc.get("num_workers", 8)
+    nw = tc.get("num_workers", 4)
+    pw = nw > 0
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
-                              num_workers=nw, pin_memory=True, persistent_workers=True)
+                              num_workers=nw, pin_memory=True, persistent_workers=pw)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
-                            num_workers=nw, pin_memory=True, persistent_workers=True)
+                            num_workers=nw, pin_memory=True, persistent_workers=pw)
 
     for epoch in range(start_epoch, tc["epochs"]):
         model.train()
