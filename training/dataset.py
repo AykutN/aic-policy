@@ -3,14 +3,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import h5py
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
-import torchvision.transforms.functional as TF
 
 
 class AICDataset(Dataset):
@@ -44,14 +42,12 @@ class AICDataset(Dataset):
         augment: bool = False,
         train: bool = True,
         train_val_split: float = 0.9,
-        image_size: Optional[Tuple[int, int]] = None,
     ):
         self.subtask = subtask
         self.To_img = obs_window_image
         self.To_prop = obs_window_proprio
         self.Tp = action_chunk
         self.augment = augment
-        self.image_size = image_size  # (H, W) to resize to, or None to keep original
         self._file_cache: Dict[str, h5py.File] = {}  # lazy per-worker file handles
 
         # Collect episode files, episode-level train/val split
@@ -88,22 +84,14 @@ class AICDataset(Dataset):
         obs = f["observations"]
         act = f["actions"]
 
-        # Images: (To_img, 3_cams, H, W, C) → (To_img, 3_cams, C, H, W), float32 [0,1]
+        # Images returned as uint8 (To, 3_cams, C, H, W) — float conversion + resize on GPU
         img_start = t - self.To_img + 1
         imgs = np.stack([
             obs["left_image"][img_start:t + 1],
             obs["center_image"][img_start:t + 1],
             obs["right_image"][img_start:t + 1],
-        ], axis=1)
-        imgs = torch.from_numpy(imgs).float() / 255.0
-        imgs = imgs.permute(0, 1, 4, 2, 3)  # (To, 3, C, H, W)
-
-        if self.image_size is not None:
-            To, n_cams, C, H, W = imgs.shape
-            imgs = F.interpolate(
-                imgs.reshape(To * n_cams, C, H, W),
-                size=self.image_size, mode="bilinear", align_corners=False,
-            ).reshape(To, n_cams, C, *self.image_size)
+        ], axis=1)  # (To, 3, H, W, C) uint8
+        imgs = torch.from_numpy(np.ascontiguousarray(imgs.transpose(0, 1, 4, 2, 3)))  # (To, 3, C, H, W) uint8
 
         # Proprioceptive: (To_prop, 34)
         prop_start = t - self.To_prop + 1
@@ -127,29 +115,13 @@ class AICDataset(Dataset):
         plug_type = int(obs["plug_type"][t])
         port_id = int(obs["port_id"][t])
 
-        if self.augment:
-            imgs = self._augment(imgs)
-
         return {
-            "images": imgs,
+            "images": imgs,  # uint8, raw resolution — preprocess_images() in train loop
             "proprio": torch.from_numpy(proprio),
             "ft": torch.from_numpy(ft),
             "actions": torch.from_numpy(actions),
             "plug_type": torch.tensor(plug_type, dtype=torch.long),
             "port_id": torch.tensor(port_id, dtype=torch.long),
+            "augment": torch.tensor(self.augment),
         }
 
-    def _augment(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Color jitter with consistent parameters across all cameras and timesteps."""
-        brightness, contrast, saturation, hue = 0.2, 0.2, 0.2, 0.05
-        b = 1 + (torch.rand(1).item() - 0.5) * 2 * brightness
-        c = 1 + (torch.rand(1).item() - 0.5) * 2 * contrast
-        s = 1 + (torch.rand(1).item() - 0.5) * 2 * saturation
-        h = (torch.rand(1).item() - 0.5) * 2 * hue
-        To, n_cams, C, H, W = imgs.shape
-        flat = imgs.reshape(To * n_cams, C, H, W)
-        flat = TF.adjust_brightness(flat, b)
-        flat = TF.adjust_contrast(flat, c)
-        flat = TF.adjust_saturation(flat, s)
-        flat = TF.adjust_hue(flat, h)
-        return flat.reshape(To, n_cams, C, H, W)

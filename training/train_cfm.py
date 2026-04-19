@@ -13,6 +13,8 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 import yaml
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -20,6 +22,23 @@ from tqdm import tqdm
 
 from training.dataset import AICDataset
 from training.models.cfm import CFMPolicy
+
+
+def preprocess_images(imgs: torch.Tensor, image_size: tuple, augment: bool) -> torch.Tensor:
+    """uint8 (B, To, 3, C, H, W) → float32 [0,1] resized, optionally augmented. Runs on GPU."""
+    B, To, n_cams, C, H, W = imgs.shape
+    flat = imgs.reshape(B * To * n_cams, C, H, W).float() / 255.0
+    flat = F.interpolate(flat, size=image_size, mode="bilinear", align_corners=False)
+    if augment:
+        b = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
+        c = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
+        s = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
+        h = (torch.rand(1, device=flat.device).item() - 0.5) * 0.1
+        flat = TF.adjust_brightness(flat, b)
+        flat = TF.adjust_contrast(flat, c)
+        flat = TF.adjust_saturation(flat, s)
+        flat = TF.adjust_hue(flat, h)
+    return flat.reshape(B, To, n_cams, C, *image_size)
 
 
 def load_config(path: str) -> dict:
@@ -88,9 +107,7 @@ def train(args):
             scheduler.step()
         print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
 
-    img_size = dc.get("image_size")
-    if img_size is not None:
-        img_size = tuple(img_size)  # [H, W] → (H, W)
+    img_size = tuple(dc["image_size"]) if dc.get("image_size") else (128, 144)
 
     train_ds = AICDataset(
         args.dataset, subtask=args.subtask,
@@ -99,7 +116,6 @@ def train(args):
         action_chunk=mc["action_chunk"],
         augment=True, train=True,
         train_val_split=dc["train_val_split"],
-        image_size=img_size,
     )
     val_ds = AICDataset(
         args.dataset, subtask=args.subtask,
@@ -108,7 +124,6 @@ def train(args):
         action_chunk=mc["action_chunk"],
         augment=False, train=False,
         train_val_split=dc["train_val_split"],
-        image_size=img_size,
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     if len(train_ds) == 0 or len(val_ds) == 0:
@@ -120,10 +135,10 @@ def train(args):
     mp_ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
                               num_workers=nw, pin_memory=pm, persistent_workers=pw,
-                              multiprocessing_context=mp_ctx)
+                              multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
                             num_workers=nw, pin_memory=pm, persistent_workers=pw,
-                            multiprocessing_context=mp_ctx)
+                            multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
 
     print(f"Starting training on {device} | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw}")
     for epoch in range(start_epoch, tc["epochs"]):
@@ -131,10 +146,10 @@ def train(args):
         train_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]", leave=False, dynamic_ncols=True)
         for batch in pbar:
-            images = batch["images"].to(device)
-            proprio = batch["proprio"].to(device)
-            ft = batch["ft"].to(device)
-            actions = batch["actions"].to(device)
+            images = preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=True)
+            proprio = batch["proprio"].to(device, non_blocking=True)
+            ft = batch["ft"].to(device, non_blocking=True)
+            actions = batch["actions"].to(device, non_blocking=True)
             optimizer.zero_grad()
             with autocast(device.type):
                 loss = model.loss(images, proprio, ft, actions)
@@ -154,10 +169,10 @@ def train(args):
             for batch in tqdm(val_loader, desc=f"Epoch {epoch:03d} [val]", leave=False, dynamic_ncols=True):
                 with autocast(device.type):
                     val_loss += model.loss(
-                        batch["images"].to(device),
-                        batch["proprio"].to(device),
-                        batch["ft"].to(device),
-                        batch["actions"].to(device),
+                        preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=False),
+                        batch["proprio"].to(device, non_blocking=True),
+                        batch["ft"].to(device, non_blocking=True),
+                        batch["actions"].to(device, non_blocking=True),
                     ).item()
         val_loss /= len(val_loader)
 
