@@ -16,6 +16,7 @@ import torch.nn as nn
 import yaml
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from training.dataset import AICDataset
 from training.models.cfm import CFMPolicy
@@ -68,7 +69,7 @@ def train(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tc["epochs"])
-    scaler = GradScaler("cuda")
+    scaler = GradScaler(device.type)
 
     start_epoch = 0
     best_val_loss = float("inf")
@@ -104,6 +105,8 @@ def train(args):
         train_val_split=dc["train_val_split"],
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise RuntimeError(f"Empty dataset for subtask={args.subtask}. Check your dataset path and subtask index.")
 
     nw = tc.get("num_workers", 4)
     pw = nw > 0
@@ -116,16 +119,18 @@ def train(args):
                             num_workers=nw, pin_memory=pm, persistent_workers=pw,
                             multiprocessing_context=mp_ctx)
 
+    print(f"Starting training on {device} | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw}")
     for epoch in range(start_epoch, tc["epochs"]):
         model.train()
         train_loss = 0.0
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]", leave=False, dynamic_ncols=True)
+        for batch in pbar:
             images = batch["images"].to(device)
             proprio = batch["proprio"].to(device)
             ft = batch["ft"].to(device)
             actions = batch["actions"].to(device)
             optimizer.zero_grad()
-            with autocast("cuda"):
+            with autocast(device.type):
                 loss = model.loss(images, proprio, ft, actions)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -133,14 +138,15 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
         train_loss /= len(train_loader)
         scheduler.step()
 
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in val_loader:
-                with autocast("cuda"):
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch:03d} [val]", leave=False, dynamic_ncols=True):
+                with autocast(device.type):
                     val_loss += model.loss(
                         batch["images"].to(device),
                         batch["proprio"].to(device),
