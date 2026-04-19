@@ -17,7 +17,7 @@ data:
   image_size: [256, 288]
 
 training:
-  batch_size: 32              # AMP enabled — safe on 4070S 12GB
+  batch_size: 64              # AMP enabled — safe on 4070S 12GB
   lr: 1e-4
   weight_decay: 1e-4
   epochs: 200
