@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
 
@@ -43,12 +44,15 @@ class AICDataset(Dataset):
         augment: bool = False,
         train: bool = True,
         train_val_split: float = 0.9,
+        image_size: Optional[Tuple[int, int]] = None,
     ):
         self.subtask = subtask
         self.To_img = obs_window_image
         self.To_prop = obs_window_proprio
         self.Tp = action_chunk
         self.augment = augment
+        self.image_size = image_size  # (H, W) to resize to, or None to keep original
+        self._file_cache: Dict[str, h5py.File] = {}  # lazy per-worker file handles
 
         # Collect episode files, episode-level train/val split
         all_episodes = sorted(Path(dataset_dir).glob("episode_*.hdf5"))
@@ -72,44 +76,56 @@ class AICDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    def _get_file(self, ep_path: Path) -> h5py.File:
+        key = str(ep_path)
+        if key not in self._file_cache:
+            self._file_cache[key] = h5py.File(ep_path, "r", swmr=True)
+        return self._file_cache[key]
+
     def __getitem__(self, idx: int) -> dict:
         ep_path, t = self._index[idx]
-        with h5py.File(ep_path, "r", swmr=True) as f:
-            obs = f["observations"]
-            act = f["actions"]
+        f = self._get_file(ep_path)
+        obs = f["observations"]
+        act = f["actions"]
 
-            # Images: (To_img, 3, C, H, W)
-            img_start = t - self.To_img + 1
-            imgs = np.stack([
-                obs["left_image"][img_start:t + 1],
-                obs["center_image"][img_start:t + 1],
-                obs["right_image"][img_start:t + 1],
-            ], axis=1)  # (To_img, 3_cams, H, W, C)
-            # → (To_img, 3_cams, C, H, W), float32 [0,1]
-            imgs = torch.from_numpy(imgs).float() / 255.0
-            imgs = imgs.permute(0, 1, 4, 2, 3)
+        # Images: (To_img, 3_cams, H, W, C) → (To_img, 3_cams, C, H, W), float32 [0,1]
+        img_start = t - self.To_img + 1
+        imgs = np.stack([
+            obs["left_image"][img_start:t + 1],
+            obs["center_image"][img_start:t + 1],
+            obs["right_image"][img_start:t + 1],
+        ], axis=1)
+        imgs = torch.from_numpy(imgs).float() / 255.0
+        imgs = imgs.permute(0, 1, 4, 2, 3)  # (To, 3, C, H, W)
 
-            # Proprioceptive: (To_prop, 34)
-            prop_start = t - self.To_prop + 1
-            proprio_parts = [
-                obs[field][prop_start:t + 1] for field, _ in self.PROPRIO_FIELDS
-            ]
-            proprio = np.concatenate(proprio_parts, axis=-1).astype(np.float32)
+        if self.image_size is not None:
+            To, n_cams, C, H, W = imgs.shape
+            imgs = F.interpolate(
+                imgs.reshape(To * n_cams, C, H, W),
+                size=self.image_size, mode="bilinear", align_corners=False,
+            ).reshape(To, n_cams, C, *self.image_size)
 
-            # F/T: (To_prop, 6)
-            ft_parts = [obs[field][prop_start:t + 1] for field, _ in self.FT_FIELDS]
-            ft = np.concatenate(ft_parts, axis=-1).astype(np.float32)
+        # Proprioceptive: (To_prop, 34)
+        prop_start = t - self.To_prop + 1
+        proprio = np.concatenate(
+            [obs[field][prop_start:t + 1] for field, _ in self.PROPRIO_FIELDS], axis=-1
+        ).astype(np.float32)
 
-            # Actions: (Tp, 20)
-            act_parts = [act[field][t:t + self.Tp] for field, _ in self.ACTION_FIELDS]
-            actions = np.concatenate(act_parts, axis=-1).astype(np.float32)
-            # Pad last episode steps with last action if needed
-            if actions.shape[0] < self.Tp:
-                pad = np.repeat(actions[-1:], self.Tp - actions.shape[0], axis=0)
-                actions = np.concatenate([actions, pad], axis=0)
+        # F/T: (To_prop, 6)
+        ft = np.concatenate(
+            [obs[field][prop_start:t + 1] for field, _ in self.FT_FIELDS], axis=-1
+        ).astype(np.float32)
 
-            plug_type = int(obs["plug_type"][t])
-            port_id = int(obs["port_id"][t])
+        # Actions: (Tp, 20)
+        actions = np.concatenate(
+            [act[field][t:t + self.Tp] for field, _ in self.ACTION_FIELDS], axis=-1
+        ).astype(np.float32)
+        if actions.shape[0] < self.Tp:
+            pad = np.repeat(actions[-1:], self.Tp - actions.shape[0], axis=0)
+            actions = np.concatenate([actions, pad], axis=0)
+
+        plug_type = int(obs["plug_type"][t])
+        port_id = int(obs["port_id"][t])
 
         if self.augment:
             imgs = self._augment(imgs)
@@ -126,21 +142,14 @@ class AICDataset(Dataset):
     def _augment(self, imgs: torch.Tensor) -> torch.Tensor:
         """Color jitter with consistent parameters across all cameras and timesteps."""
         brightness, contrast, saturation, hue = 0.2, 0.2, 0.2, 0.05
-        # Sample once per sample — same lighting perturbation for all cameras and timesteps
         b = 1 + (torch.rand(1).item() - 0.5) * 2 * brightness
         c = 1 + (torch.rand(1).item() - 0.5) * 2 * contrast
         s = 1 + (torch.rand(1).item() - 0.5) * 2 * saturation
         h = (torch.rand(1).item() - 0.5) * 2 * hue
         To, n_cams, C, H, W = imgs.shape
-        out = []
-        for t in range(To):
-            frame_cams = []
-            for cam in range(n_cams):
-                img = imgs[t, cam]
-                img = TF.adjust_brightness(img, b)
-                img = TF.adjust_contrast(img, c)
-                img = TF.adjust_saturation(img, s)
-                img = TF.adjust_hue(img, h)
-                frame_cams.append(img)
-            out.append(torch.stack(frame_cams))
-        return torch.stack(out)
+        flat = imgs.reshape(To * n_cams, C, H, W)
+        flat = TF.adjust_brightness(flat, b)
+        flat = TF.adjust_contrast(flat, c)
+        flat = TF.adjust_saturation(flat, s)
+        flat = TF.adjust_hue(flat, h)
+        return flat.reshape(To, n_cams, C, H, W)

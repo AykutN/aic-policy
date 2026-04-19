@@ -88,6 +88,10 @@ def train(args):
             scheduler.step()
         print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
 
+    img_size = dc.get("image_size")
+    if img_size is not None:
+        img_size = tuple(img_size)  # [H, W] → (H, W)
+
     train_ds = AICDataset(
         args.dataset, subtask=args.subtask,
         obs_window_image=dc["obs_window_image"],
@@ -95,6 +99,7 @@ def train(args):
         action_chunk=mc["action_chunk"],
         augment=True, train=True,
         train_val_split=dc["train_val_split"],
+        image_size=img_size,
     )
     val_ds = AICDataset(
         args.dataset, subtask=args.subtask,
@@ -103,6 +108,7 @@ def train(args):
         action_chunk=mc["action_chunk"],
         augment=False, train=False,
         train_val_split=dc["train_val_split"],
+        image_size=img_size,
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     if len(train_ds) == 0 or len(val_ds) == 0:
