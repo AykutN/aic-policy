@@ -8,13 +8,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import subprocess
 from pathlib import Path
 
+import kornia.augmentation as Ka
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 import yaml
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -23,21 +24,17 @@ from tqdm import tqdm
 from training.dataset import AICDataset
 from training.models.cfm import CFMPolicy
 
+# Per-image color jitter on GPU via kornia — each image gets independent random params
+_GPU_AUG = Ka.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=1.0)
+
 
 def preprocess_images(imgs: torch.Tensor, image_size: tuple, augment: bool) -> torch.Tensor:
-    """uint8 (B, To, 3, C, H, W) → float32 [0,1] resized, optionally augmented. Runs on GPU."""
+    """uint8 (B, To, n_cams, C, H, W) → float32 [0,1] resized, optionally augmented."""
     B, To, n_cams, C, H, W = imgs.shape
     flat = imgs.reshape(B * To * n_cams, C, H, W).float() / 255.0
     flat = F.interpolate(flat, size=image_size, mode="bilinear", align_corners=False)
     if augment:
-        b = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
-        c = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
-        s = 1 + (torch.rand(1, device=flat.device).item() - 0.5) * 0.4
-        h = (torch.rand(1, device=flat.device).item() - 0.5) * 0.1
-        flat = TF.adjust_brightness(flat, b)
-        flat = TF.adjust_contrast(flat, c)
-        flat = TF.adjust_saturation(flat, s)
-        flat = TF.adjust_hue(flat, h)
+        flat = _GPU_AUG(flat).clamp(0.0, 1.0)
     return flat.reshape(B, To, n_cams, C, *image_size)
 
 
@@ -50,16 +47,23 @@ def s3_sync(local: str, s3: str):
     subprocess.run(["aws", "s3", "sync", local, s3, "--quiet"], check=False)
 
 
-def save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, path: Path):
+def save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scaler_state": scaler.state_dict(),
+        "ema_state": ema_state,
         "val_loss": val_loss,
         "patience_counter": patience_counter,
     }, path)
+
+
+def update_ema(ema_state: dict, model: nn.Module, decay: float = 0.999):
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            ema_state[k].mul_(decay).add_(v, alpha=1.0 - decay)
 
 
 def train(args):
@@ -90,6 +94,9 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tc["epochs"])
     scaler = GradScaler(device.type)
 
+    # EMA state: shadow copy of model weights updated each step
+    ema_state = copy.deepcopy(model.state_dict())
+
     start_epoch = 0
     best_val_loss = float("inf")
     patience_counter = 0
@@ -100,6 +107,8 @@ def train(args):
         optimizer.load_state_dict(ckpt["optimizer_state"])
         if "scaler_state" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state"])
+        if "ema_state" in ckpt:
+            ema_state = ckpt["ema_state"]
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
         patience_counter = ckpt.get("patience_counter", 0)
@@ -127,20 +136,19 @@ def train(args):
     )
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
     if len(train_ds) == 0 or len(val_ds) == 0:
-        raise RuntimeError(f"Empty dataset for subtask={args.subtask}. Check your dataset path and subtask index.")
+        raise RuntimeError(f"Empty dataset for subtask={args.subtask}.")
 
     nw = tc.get("num_workers", 4)
     pw = nw > 0
-    pm = nw > 0
     mp_ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
-                              num_workers=nw, pin_memory=pm, persistent_workers=pw,
+                              num_workers=nw, pin_memory=pw, persistent_workers=pw,
                               multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
-                            num_workers=nw, pin_memory=pm, persistent_workers=pw,
+                            num_workers=nw, pin_memory=pw, persistent_workers=pw,
                             multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
 
-    print(f"Starting training on {device} | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw}")
+    print(f"Starting training | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw}")
     for epoch in range(start_epoch, tc["epochs"]):
         model.train()
         train_loss = 0.0
@@ -158,12 +166,16 @@ def train(args):
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
+            update_ema(ema_state, model)
             train_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
         train_loss /= len(train_loader)
         scheduler.step()
 
+        # Validation with EMA weights
         model.eval()
+        original_state = copy.deepcopy(model.state_dict())
+        model.load_state_dict(ema_state)
         val_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch:03d} [val]", leave=False, dynamic_ncols=True):
@@ -175,11 +187,13 @@ def train(args):
                         batch["actions"].to(device, non_blocking=True),
                     ).item()
         val_loss /= len(val_loader)
+        model.load_state_dict(original_state)
 
-        print(f"Epoch {epoch:03d} | train={train_loss:.4f} | val={val_loss:.4f}")
+        print(f"Epoch {epoch:03d} | train={train_loss:.4f} | val(ema)={val_loss:.4f}")
 
-        save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, checkpoint_dir / f"epoch_{epoch:04d}.pt")
-        save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, latest_ckpt)
+        save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter,
+                        checkpoint_dir / f"epoch_{epoch:04d}.pt")
+        save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter, latest_ckpt)
 
         if (epoch + 1) % tc["s3_sync_every_n"] == 0:
             print(f"  S3 sync...")
@@ -188,7 +202,10 @@ def train(args):
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            save_checkpoint(model, optimizer, scaler, epoch, val_loss, patience_counter, checkpoint_dir / "best.pt")
+            # best.pt stores EMA weights directly for clean inference
+            path = checkpoint_dir / "best.pt"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"epoch": epoch, "model_state": ema_state, "val_loss": val_loss}, path)
         else:
             patience_counter += 1
             if patience_counter >= tc["early_stopping_patience"]:

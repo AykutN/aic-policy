@@ -23,12 +23,18 @@ class ImageEncoder(nn.Module):
             param.requires_grad = "layer3" in name or "layer4" in name
         self.proj = nn.Linear(512, feature_dim)
 
+    # ImageNet stats — kept as buffers so they move with the model to GPU
+    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    _IMAGENET_STD  = [0.229, 0.224, 0.225]
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, To, n_cams, C, H, W = x.shape
-        # Flatten batch × time × cameras
         x = x.reshape(B * To * n_cams, C, H, W)
+        mean = torch.tensor(self._IMAGENET_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std  = torch.tensor(self._IMAGENET_STD,  device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        x = (x - mean) / std
         feat = self.backbone(x).squeeze(-1).squeeze(-1)  # (B*To*n_cams, 512)
-        feat = feat.reshape(B, To * n_cams, 512).mean(dim=1)  # temporal+camera mean
+        feat = feat.reshape(B, To * n_cams, 512).mean(dim=1)
         return self.proj(feat)  # (B, feature_dim)
 
 
