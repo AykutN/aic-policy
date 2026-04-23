@@ -37,6 +37,21 @@ def preprocess_images(imgs: torch.Tensor, image_size: tuple, augment: bool) -> t
     return flat.reshape(B, To, n_cams, C, *image_size)
 
 
+def compute_action_stats(dataset, device):
+    """Compute per-dim mean and std over all training actions."""
+    print("Computing action normalization stats...")
+    loader = DataLoader(dataset, batch_size=512, num_workers=4, shuffle=False)
+    all_actions = []
+    for batch in tqdm(loader, desc="Scanning actions", leave=False):
+        all_actions.append(batch["actions"])
+    all_actions = torch.cat(all_actions, dim=0)          # (N, Tp, 20)
+    mean = all_actions.mean(dim=(0, 1)).to(device)       # (20,)
+    std  = all_actions.std(dim=(0, 1)).clamp(min=1.0).to(device)  # clamp so constant dims don't explode
+    print(f"  Action mean: {mean.cpu().numpy().round(2)}")
+    print(f"  Action std:  {std.cpu().numpy().round(2)}")
+    return mean, std
+
+
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -52,6 +67,7 @@ def rclone_sync_async(local: str, remote: str):
 
 
 def save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                    act_mean, act_std,
                     epoch, val_loss, patience_counter, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -61,6 +77,8 @@ def save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
         "ema_state": ema_state,
+        "act_mean": act_mean.cpu(),
+        "act_std": act_std.cpu(),
         "val_loss": val_loss,
         "patience_counter": patience_counter,
     }, path)
@@ -73,11 +91,13 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_n: int):
         old.unlink(missing_ok=True)
 
 
-def update_ema(ema_state: dict, model: nn.Module, decay: float = 0.999):
+def update_ema(ema_state: dict, model: nn.Module, step: int, decay: float = 0.999):
+    """EMA with warmup: starts fast, converges to target decay."""
+    adaptive_decay = min(decay, (1.0 + step) / (10.0 + step))
     with torch.no_grad():
         for k, v in model.state_dict().items():
             if ema_state[k].is_floating_point():
-                ema_state[k].mul_(decay).add_(v, alpha=1.0 - decay)
+                ema_state[k].mul_(adaptive_decay).add_(v, alpha=1.0 - adaptive_decay)
             else:
                 ema_state[k].copy_(v)
 
@@ -118,6 +138,8 @@ def train(args):
     start_epoch = 0
     best_val_loss = float("inf")
     patience_counter = 0
+    global_step = 0
+    act_mean = act_std = None
 
     if args.resume and latest_ckpt.exists():
         ckpt = torch.load(latest_ckpt, map_location=device)
@@ -126,6 +148,8 @@ def train(args):
         scheduler.load_state_dict(ckpt["scheduler_state"])
         scaler.load_state_dict(ckpt["scaler_state"])
         ema_state = ckpt["ema_state"]
+        act_mean = ckpt["act_mean"].to(device)
+        act_std  = ckpt["act_std"].to(device)
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
         patience_counter = ckpt.get("patience_counter", 0)
@@ -153,6 +177,9 @@ def train(args):
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError(f"Empty dataset for subtask={args.subtask}.")
 
+    if act_mean is None:
+        act_mean, act_std = compute_action_stats(train_ds, device)
+
     nw = tc.get("num_workers", 4)
     pf = tc.get("prefetch_factor", 2)
     pw = nw > 0
@@ -177,10 +204,11 @@ def train(args):
         grad_norm_avg = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]", leave=False, dynamic_ncols=True)
         for batch in pbar:
-            images = preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=True)
+            images  = preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=True)
             proprio = batch["proprio"].to(device, non_blocking=True)
-            ft = batch["ft"].to(device, non_blocking=True)
-            actions = batch["actions"].to(device, non_blocking=True)
+            ft      = batch["ft"].to(device, non_blocking=True)
+            actions = (batch["actions"].to(device, non_blocking=True) - act_mean) / act_std
+
             optimizer.zero_grad()
             with autocast(device.type):
                 loss = model.loss(images, proprio, ft, actions)
@@ -189,7 +217,8 @@ def train(args):
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
             scaler.step(optimizer)
             scaler.update()
-            update_ema(ema_state, model)
+            update_ema(ema_state, model, global_step)
+            global_step += 1
             train_loss += loss.item()
             grad_norm_avg += grad_norm
             pbar.set_postfix(loss=f"{loss.item():.4f}", gnorm=f"{grad_norm:.2f}")
@@ -205,11 +234,12 @@ def train(args):
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch:03d} [val]", leave=False, dynamic_ncols=True):
                 with autocast(device.type):
+                    actions_norm = (batch["actions"].to(device, non_blocking=True) - act_mean) / act_std
                     val_loss += model.loss(
                         preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=False),
                         batch["proprio"].to(device, non_blocking=True),
                         batch["ft"].to(device, non_blocking=True),
-                        batch["actions"].to(device, non_blocking=True),
+                        actions_norm,
                     ).item()
         val_loss /= len(val_loader)
         model.load_state_dict(original_state)
@@ -218,9 +248,11 @@ def train(args):
         print(f"Epoch {epoch:03d} | train={train_loss:.4f} | val(ema)={val_loss:.4f} | gnorm={grad_norm_avg:.3f} | lr={lr_now:.2e}")
 
         save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                        act_mean, act_std,
                         epoch, val_loss, patience_counter,
                         checkpoint_dir / f"epoch_{epoch:04d}.pt")
         save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                        act_mean, act_std,
                         epoch, val_loss, patience_counter, latest_ckpt)
         prune_old_checkpoints(checkpoint_dir, keep_n)
 
@@ -233,7 +265,13 @@ def train(args):
             patience_counter = 0
             path = checkpoint_dir / "best.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"epoch": epoch, "model_state": ema_state, "val_loss": val_loss}, path)
+            torch.save({
+                "epoch": epoch,
+                "model_state": ema_state,
+                "act_mean": act_mean.cpu(),
+                "act_std": act_std.cpu(),
+                "val_loss": val_loss,
+            }, path)
             print(f"  ✓ best.pt updated (val={val_loss:.4f})")
         else:
             patience_counter += 1
