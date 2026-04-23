@@ -76,7 +76,10 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_n: int):
 def update_ema(ema_state: dict, model: nn.Module, decay: float = 0.999):
     with torch.no_grad():
         for k, v in model.state_dict().items():
-            ema_state[k].mul_(decay).add_(v, alpha=1.0 - decay)
+            if ema_state[k].is_floating_point():
+                ema_state[k].mul_(decay).add_(v, alpha=1.0 - decay)
+            else:
+                ema_state[k].copy_(v)
 
 
 def train(args):
