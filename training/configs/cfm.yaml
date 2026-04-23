@@ -4,29 +4,31 @@ model:
   ft_feature_dim: 128
   proprio_feature_dim: 64
   fusion_dim: 256
-  flow_hidden_dim: 512        # MLP hidden dim for flow network
+  flow_hidden_dim: 512
   flow_layers: 6
   action_dim: 20
   action_chunk: 32
 
 data:
-  control_hz: 20              # dataset collected at 20Hz
-  obs_window_image: 4         # 4 steps = 200ms at 20Hz
-  obs_window_proprio: 16      # 16 steps = 800ms at 20Hz
+  control_hz: 20
+  obs_window_image: 4
+  obs_window_proprio: 16
   train_val_split: 0.9
   image_size: [128, 144]
 
 training:
-  batch_size: 64              # AMP enabled — safe on 4070S 12GB
+  batch_size: 64
   lr: 0.0001
   weight_decay: 0.0001
   epochs: 200
   early_stopping_patience: 20
-  num_workers: 12             # 5950X 16-core; leave 4 for OS + main process
-  checkpoint_every_n: 1
-  s3_sync_every_n: 5
-  s3_bucket: "s3://aic-yusuf/checkpoints"
+  num_workers: 12
+  prefetch_factor: 2
+  keep_last_n_checkpoints: 3
+  rclone_sync_every_n: 5
+  rclone_remote: "gdrive:aic-checkpoints"
   checkpoint_dir: "/workspace/checkpoints"
+  seed: 42
 
 inference:
-  n_flow_steps: 10            # ODE integration steps (inference only, not used during training)
+  n_flow_steps: 10

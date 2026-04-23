@@ -24,12 +24,11 @@ from tqdm import tqdm
 from training.dataset import AICDataset
 from training.models.cfm import CFMPolicy
 
-# Per-image color jitter on GPU via kornia — each image gets independent random params
 _GPU_AUG = Ka.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=1.0)
 
 
 def preprocess_images(imgs: torch.Tensor, image_size: tuple, augment: bool) -> torch.Tensor:
-    """uint8 (B, To, n_cams, C, H, W) → float32 [0,1] resized, optionally augmented."""
+    """uint8 (B, To, n_cams, C, H, W) → float32 resized, per-image augmented on GPU."""
     B, To, n_cams, C, H, W = imgs.shape
     flat = imgs.reshape(B * To * n_cams, C, H, W).float() / 255.0
     flat = F.interpolate(flat, size=image_size, mode="bilinear", align_corners=False)
@@ -43,21 +42,35 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def s3_sync(local: str, s3: str):
-    subprocess.run(["aws", "s3", "sync", local, s3, "--quiet"], check=False)
+def rclone_sync_async(local: str, remote: str):
+    """Non-blocking rclone copy — GPU keeps running while upload happens in background."""
+    subprocess.Popen(
+        ["rclone", "copy", local, remote, "--quiet"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
-def save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter, path: Path):
+def save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                    epoch, val_loss, patience_counter, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "epoch": epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
         "ema_state": ema_state,
         "val_loss": val_loss,
         "patience_counter": patience_counter,
     }, path)
+
+
+def prune_old_checkpoints(checkpoint_dir: Path, keep_n: int):
+    """Keep only the last keep_n epoch_XXXX.pt files to avoid filling disk."""
+    ckpts = sorted(checkpoint_dir.glob("epoch_*.pt"))
+    for old in ckpts[:-keep_n]:
+        old.unlink(missing_ok=True)
 
 
 def update_ema(ema_state: dict, model: nn.Module, decay: float = 0.999):
@@ -72,12 +85,16 @@ def train(args):
     dc = cfg["data"]
     tc = cfg["training"]
 
+    seed = tc.get("seed", 42)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     checkpoint_dir = Path(tc["checkpoint_dir"]).expanduser() / f"cfm_subtask{args.subtask}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     latest_ckpt = checkpoint_dir / "latest.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device} | seed={seed}")
 
     model = CFMPolicy(
         image_feature_dim=mc["image_feature_dim"],
@@ -93,8 +110,6 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tc["epochs"])
     scaler = GradScaler(device.type)
-
-    # EMA state: shadow copy of model weights updated each step
     ema_state = copy.deepcopy(model.state_dict())
 
     start_epoch = 0
@@ -105,16 +120,13 @@ def train(args):
         ckpt = torch.load(latest_ckpt, map_location=device)
         model.load_state_dict(ckpt["model_state"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
-        if "scaler_state" in ckpt:
-            scaler.load_state_dict(ckpt["scaler_state"])
-        if "ema_state" in ckpt:
-            ema_state = ckpt["ema_state"]
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        scaler.load_state_dict(ckpt["scaler_state"])
+        ema_state = ckpt["ema_state"]
         start_epoch = ckpt["epoch"] + 1
         best_val_loss = ckpt["val_loss"]
         patience_counter = ckpt.get("patience_counter", 0)
-        for _ in range(start_epoch):
-            scheduler.step()
-        print(f"Resumed from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}, patience={patience_counter}")
+        print(f"Resumed epoch {start_epoch} | best_val={best_val_loss:.4f} | patience={patience_counter}")
 
     img_size = tuple(dc["image_size"]) if dc.get("image_size") else (128, 144)
 
@@ -134,24 +146,32 @@ def train(args):
         augment=False, train=False,
         train_val_split=dc["train_val_split"],
     )
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
     if len(train_ds) == 0 or len(val_ds) == 0:
         raise RuntimeError(f"Empty dataset for subtask={args.subtask}.")
 
     nw = tc.get("num_workers", 4)
+    pf = tc.get("prefetch_factor", 2)
     pw = nw > 0
     mp_ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=tc["batch_size"], shuffle=True,
                               num_workers=nw, pin_memory=pw, persistent_workers=pw,
-                              multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
+                              multiprocessing_context=mp_ctx,
+                              prefetch_factor=pf if nw > 0 else None)
     val_loader = DataLoader(val_ds, batch_size=tc["batch_size"], shuffle=False,
                             num_workers=nw, pin_memory=pw, persistent_workers=pw,
-                            multiprocessing_context=mp_ctx, prefetch_factor=4 if nw > 0 else None)
+                            multiprocessing_context=mp_ctx,
+                            prefetch_factor=pf if nw > 0 else None)
 
-    print(f"Starting training | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw}")
+    rclone_remote = tc.get("rclone_remote", "")
+    rclone_every  = tc.get("rclone_sync_every_n", 5)
+    keep_n        = tc.get("keep_last_n_checkpoints", 3)
+
+    print(f"Training | epochs={tc['epochs']} | batch={tc['batch_size']} | workers={nw} | prefetch={pf}")
     for epoch in range(start_epoch, tc["epochs"]):
         model.train()
         train_loss = 0.0
+        grad_norm_avg = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [train]", leave=False, dynamic_ncols=True)
         for batch in pbar:
             images = preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=True)
@@ -163,16 +183,18 @@ def train(args):
                 loss = model.loss(images, proprio, ft, actions)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
             scaler.step(optimizer)
             scaler.update()
             update_ema(ema_state, model)
             train_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            grad_norm_avg += grad_norm
+            pbar.set_postfix(loss=f"{loss.item():.4f}", gnorm=f"{grad_norm:.2f}")
         train_loss /= len(train_loader)
+        grad_norm_avg /= len(train_loader)
         scheduler.step()
 
-        # Validation with EMA weights
+        # Validate with EMA weights
         model.eval()
         original_state = copy.deepcopy(model.state_dict())
         model.load_state_dict(ema_state)
@@ -189,30 +211,35 @@ def train(args):
         val_loss /= len(val_loader)
         model.load_state_dict(original_state)
 
-        print(f"Epoch {epoch:03d} | train={train_loss:.4f} | val(ema)={val_loss:.4f}")
+        lr_now = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch:03d} | train={train_loss:.4f} | val(ema)={val_loss:.4f} | gnorm={grad_norm_avg:.3f} | lr={lr_now:.2e}")
 
-        save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter,
+        save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                        epoch, val_loss, patience_counter,
                         checkpoint_dir / f"epoch_{epoch:04d}.pt")
-        save_checkpoint(model, optimizer, scaler, ema_state, epoch, val_loss, patience_counter, latest_ckpt)
+        save_checkpoint(model, optimizer, scheduler, scaler, ema_state,
+                        epoch, val_loss, patience_counter, latest_ckpt)
+        prune_old_checkpoints(checkpoint_dir, keep_n)
 
-        if (epoch + 1) % tc["s3_sync_every_n"] == 0:
-            print(f"  S3 sync...")
-            s3_sync(str(checkpoint_dir), tc["s3_bucket"] + f"/cfm_subtask{args.subtask}")
+        if rclone_remote and (epoch + 1) % rclone_every == 0:
+            print(f"  rclone sync (async) → {rclone_remote}")
+            rclone_sync_async(str(checkpoint_dir), f"{rclone_remote}/cfm_subtask{args.subtask}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            # best.pt stores EMA weights directly for clean inference
             path = checkpoint_dir / "best.pt"
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"epoch": epoch, "model_state": ema_state, "val_loss": val_loss}, path)
+            print(f"  ✓ best.pt updated (val={val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= tc["early_stopping_patience"]:
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
-    s3_sync(str(checkpoint_dir), tc["s3_bucket"] + f"/cfm_subtask{args.subtask}")
+    if rclone_remote:
+        rclone_sync_async(str(checkpoint_dir), f"{rclone_remote}/cfm_subtask{args.subtask}")
     print(f"Done. Best val_loss: {best_val_loss:.4f}")
     print(f"Best checkpoint: {checkpoint_dir}/best.pt")
 
