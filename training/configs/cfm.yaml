@@ -26,7 +26,7 @@ training:
   checkpoint_every_n: 1
   s3_sync_every_n: 5
   s3_bucket: "s3://aic-yusuf/checkpoints"
-  checkpoint_dir: "~/checkpoints"
+  checkpoint_dir: "/workspace/checkpoints"
 
 inference:
   n_flow_steps: 10            # ODE integration steps (inference only, not used during training)
