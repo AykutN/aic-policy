@@ -46,7 +46,7 @@ def compute_action_stats(dataset, device):
         all_actions.append(batch["actions"])
     all_actions = torch.cat(all_actions, dim=0)          # (N, Tp, 20)
     mean = all_actions.mean(dim=(0, 1)).to(device)       # (20,)
-    std  = all_actions.std(dim=(0, 1)).clamp(min=1.0).to(device)  # clamp so constant dims don't explode
+    std  = all_actions.std(dim=(0, 1)).clamp(min=0.01).to(device)  # clamp so constant/near-zero dims don't explode
     print(f"  Action mean: {mean.cpu().numpy().round(2)}")
     print(f"  Action std:  {std.cpu().numpy().round(2)}")
     return mean, std
