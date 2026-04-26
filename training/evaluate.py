@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Evaluation policy: loads trained ACT checkpoints, runs as aic_model.Policy in Gazebo.
+"""Evaluation policy: loads trained CFM checkpoints, runs as aic_model.Policy in Gazebo.
 
 Usage (same as any other policy):
     pixi run ros2 run aic_model aic_model \
       --ros-args -p use_sim_time:=true \
       -p policy:=training.evaluate.TrainedPolicy \
-      -p approach_ckpt:=/home/ubuntu/checkpoints/act_subtask0/best.pt \
-      -p insert_ckpt:=/home/ubuntu/checkpoints/act_subtask1/best.pt
+      -p approach_ckpt:=/workspace/checkpoints/cfm_subtask0/best.pt \
+      -p insert_ckpt:=/workspace/checkpoints/cfm_subtask1/best.pt
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
 from geometry_msgs.msg import Pose, Vector3, Wrench
 from std_msgs.msg import Header
 
-from training.models.act import ACTPolicy
+from training.models.cfm import CFMPolicy
 
 
 IMAGE_SCALE = 0.25
@@ -37,16 +37,15 @@ def _load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def _load_act_model(ckpt_path: str, cfg: dict, device) -> ACTPolicy:
+def _load_cfm_model(ckpt_path: str, cfg: dict, device) -> CFMPolicy:
     mc = cfg["model"]
-    model = ACTPolicy(
+    model = CFMPolicy(
         image_feature_dim=mc["image_feature_dim"],
         ft_feature_dim=mc["ft_feature_dim"],
         proprio_feature_dim=mc["proprio_feature_dim"],
-        transformer_dim=mc["transformer_dim"],
-        transformer_heads=mc["transformer_heads"],
-        transformer_layers=mc["transformer_layers"],
-        latent_dim=mc["latent_dim"],
+        fusion_dim=mc["fusion_dim"],
+        flow_hidden_dim=mc["flow_hidden_dim"],
+        flow_layers=mc["flow_layers"],
         action_dim=mc["action_dim"],
         action_chunk=mc["action_chunk"],
     ).to(device)
@@ -144,15 +143,16 @@ def _action_to_motion_update(action: np.ndarray, frame_id: str, stamp) -> Motion
 
 
 class TrainedPolicy(Policy):
-    """Hierarchical trained policy: approach model (subtask=0) -> insert model (subtask=1)."""
+    """Hierarchical CFM policy: approach model (subtask=0) -> insert model (subtask=1)."""
 
     def __init__(self, parent_node):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        cfg = _load_yaml(str(Path(__file__).parent / "configs" / "act.yaml"))
+        cfg = _load_yaml(str(Path(__file__).parent / "configs" / "cfm.yaml"))
         self._obs_window_image = cfg["data"]["obs_window_image"]
         self._obs_window_proprio = cfg["data"]["obs_window_proprio"]
+        self._n_flow_steps = cfg["inference"]["n_flow_steps"]
 
         approach_ckpt = parent_node.declare_parameter("approach_ckpt", "").value
         insert_ckpt = parent_node.declare_parameter("insert_ckpt", "").value
@@ -160,8 +160,8 @@ class TrainedPolicy(Policy):
         if not approach_ckpt or not insert_ckpt:
             raise ValueError("approach_ckpt and insert_ckpt ROS params must be set")
 
-        self.approach_model = _load_act_model(approach_ckpt, cfg, self.device)
-        self.insert_model = _load_act_model(insert_ckpt, cfg, self.device)
+        self.approach_model = _load_cfm_model(approach_ckpt, cfg, self.device)
+        self.insert_model = _load_cfm_model(insert_ckpt, cfg, self.device)
         self.get_logger().info(f"Loaded approach: {approach_ckpt}")
         self.get_logger().info(f"Loaded insert: {insert_ckpt}")
 
@@ -187,7 +187,7 @@ class TrainedPolicy(Policy):
                 model = self.approach_model if step < APPROACH_STEPS else self.insert_model
                 imgs, proprio, ft = _buffer_to_tensors(obs_buffer, self._obs_window_image, self._obs_window_proprio, self.device)
                 with torch.no_grad():
-                    pred, _, _ = model(imgs, proprio, ft, actions_gt=None)
+                    pred = model.sample(imgs, proprio, ft, n_steps=self._n_flow_steps)
                 action_queue = pred[0].cpu().numpy().tolist()
 
             action = np.array(action_queue.pop(0))
