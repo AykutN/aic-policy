@@ -114,6 +114,8 @@ class AICDataset(Dataset):
 
         plug_type = int(obs["plug_type"][t])
         port_id = int(obs["port_id"][t])
+        # task_id: 0=SFP, 1=SC
+        task_id = 0 if plug_type == 0 else 1
 
         return {
             "images": imgs,  # uint8, raw resolution — preprocess_images() in train loop
@@ -122,6 +124,7 @@ class AICDataset(Dataset):
             "actions": torch.from_numpy(actions),
             "plug_type": torch.tensor(plug_type, dtype=torch.long),
             "port_id": torch.tensor(port_id, dtype=torch.long),
+            "task_id": torch.tensor(task_id, dtype=torch.long),
             "augment": torch.tensor(self.augment),
         }
 

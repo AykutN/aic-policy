@@ -84,6 +84,8 @@ class CFMPolicy(nn.Module):
         flow_layers: int = 6,
         action_dim: int = 20,
         action_chunk: int = 32,
+        n_tasks: int = 2,
+        task_emb_dim: int = 32,
     ):
         super().__init__()
         self.action_chunk = action_chunk
@@ -92,8 +94,9 @@ class CFMPolicy(nn.Module):
         self.img_enc = ImageEncoder(feature_dim=image_feature_dim)
         self.ft_enc = FTEncoder(feature_dim=ft_feature_dim)
         self.prop_enc = ProprioEncoder(feature_dim=proprio_feature_dim)
+        self.task_emb = nn.Embedding(n_tasks, task_emb_dim)
 
-        obs_dim = image_feature_dim + ft_feature_dim + proprio_feature_dim
+        obs_dim = image_feature_dim + ft_feature_dim + proprio_feature_dim + task_emb_dim
         self.cond_proj = nn.Sequential(
             nn.Linear(obs_dim, fusion_dim),
             nn.SiLU(),
@@ -102,17 +105,18 @@ class CFMPolicy(nn.Module):
 
         self.flow = FlowNet(action_dim, action_chunk, fusion_dim, flow_hidden_dim, flow_layers)
 
-    def _encode(self, images, proprio, ft):
+    def _encode(self, images, proprio, ft, task_id):
         feat = torch.cat([
             self.img_enc(images),
             self.ft_enc(ft),
             self.prop_enc(proprio),
+            self.task_emb(task_id),
         ], dim=-1)
         return self.cond_proj(feat)
 
-    def loss(self, images, proprio, ft, actions_gt: torch.Tensor) -> torch.Tensor:
+    def loss(self, images, proprio, ft, task_id, actions_gt: torch.Tensor) -> torch.Tensor:
         B = images.shape[0]
-        cond = self._encode(images, proprio, ft)
+        cond = self._encode(images, proprio, ft, task_id)
 
         x0 = torch.randn_like(actions_gt)
         t = torch.rand(B, device=actions_gt.device)
@@ -124,9 +128,9 @@ class CFMPolicy(nn.Module):
         return F.mse_loss(v_pred, v_target)
 
     @torch.no_grad()
-    def sample(self, images, proprio, ft, n_steps: int = 10) -> torch.Tensor:
+    def sample(self, images, proprio, ft, task_id, n_steps: int = 10) -> torch.Tensor:
         B = images.shape[0]
-        cond = self._encode(images, proprio, ft)
+        cond = self._encode(images, proprio, ft, task_id)
         x = torch.randn(B, self.action_chunk, self.action_dim, device=cond.device)
         dt = 1.0 / n_steps
         for i in range(n_steps):

@@ -128,6 +128,8 @@ def train(args):
         flow_layers=mc["flow_layers"],
         action_dim=mc["action_dim"],
         action_chunk=mc["action_chunk"],
+        n_tasks=mc.get("n_tasks", 2),
+        task_emb_dim=mc.get("task_emb_dim", 32),
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
@@ -207,11 +209,12 @@ def train(args):
             images  = preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=True)
             proprio = batch["proprio"].to(device, non_blocking=True)
             ft      = batch["ft"].to(device, non_blocking=True)
+            task_id = batch["task_id"].to(device, non_blocking=True)
             actions = (batch["actions"].to(device, non_blocking=True) - act_mean) / act_std
 
             optimizer.zero_grad()
             with autocast(device.type):
-                loss = model.loss(images, proprio, ft, actions)
+                loss = model.loss(images, proprio, ft, task_id, actions)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0).item()
@@ -239,6 +242,7 @@ def train(args):
                         preprocess_images(batch["images"].to(device, non_blocking=True), img_size, augment=False),
                         batch["proprio"].to(device, non_blocking=True),
                         batch["ft"].to(device, non_blocking=True),
+                        batch["task_id"].to(device, non_blocking=True),
                         actions_norm,
                     ).item()
         val_loss /= len(val_loader)

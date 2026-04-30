@@ -29,7 +29,8 @@ IMAGE_SCALE = 0.25
 OBS_WINDOW_IMAGE = 4
 OBS_WINDOW_PROPRIO = 16
 APPROACH_STEPS = 100  # matches DataCollectorPolicy
-MAX_STEPS = 2000
+CONTROL_HZ = 20
+MAX_STEPS = 600  # 30 seconds at 20Hz — stay well under the 60s scoring threshold
 
 
 def _load_yaml(path: str) -> dict:
@@ -37,7 +38,7 @@ def _load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def _load_cfm_model(ckpt_path: str, cfg: dict, device) -> CFMPolicy:
+def _load_cfm_model(ckpt_path: str, cfg: dict, device):
     mc = cfg["model"]
     model = CFMPolicy(
         image_feature_dim=mc["image_feature_dim"],
@@ -48,11 +49,16 @@ def _load_cfm_model(ckpt_path: str, cfg: dict, device) -> CFMPolicy:
         flow_layers=mc["flow_layers"],
         action_dim=mc["action_dim"],
         action_chunk=mc["action_chunk"],
+        n_tasks=mc.get("n_tasks", 2),
+        task_emb_dim=mc.get("task_emb_dim", 32),
     ).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+    state_key = "ema_state" if "ema_state" in ckpt else "model_state"
+    model.load_state_dict(ckpt[state_key])
     model.eval()
-    return model
+    act_mean = ckpt["act_mean"].to(device)
+    act_std = ckpt["act_std"].to(device)
+    return model, act_mean, act_std
 
 
 def _obs_msg_to_dict(obs) -> dict:
@@ -60,29 +66,28 @@ def _obs_msg_to_dict(obs) -> dict:
     H = int(round(1024 * IMAGE_SCALE))
     W = int(round(1152 * IMAGE_SCALE))
 
-    def decode_img(data):
-        arr = np.frombuffer(bytes(data), dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return np.zeros((H, W, 3), dtype=np.uint8)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return cv2.resize(img, (W, H))
+    def decode_img(ros_img):
+        img = np.frombuffer(bytes(ros_img.data), dtype=np.uint8).reshape(
+            ros_img.height, ros_img.width, 3
+        )
+        return cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
 
+    cs = obs.controller_state
     return {
-        "left_image": decode_img(obs.left_image.data),
-        "center_image": decode_img(obs.center_image.data),
-        "right_image": decode_img(obs.right_image.data),
-        "tcp_pos": np.array([obs.tcp_pose.position.x, obs.tcp_pose.position.y, obs.tcp_pose.position.z], dtype=np.float32),
-        "tcp_quat": np.array([obs.tcp_pose.orientation.x, obs.tcp_pose.orientation.y,
-                               obs.tcp_pose.orientation.z, obs.tcp_pose.orientation.w], dtype=np.float32),
-        "tcp_vel_lin": np.array([obs.tcp_velocity.linear.x, obs.tcp_velocity.linear.y, obs.tcp_velocity.linear.z], dtype=np.float32),
-        "tcp_vel_ang": np.array([obs.tcp_velocity.angular.x, obs.tcp_velocity.angular.y, obs.tcp_velocity.angular.z], dtype=np.float32),
-        "tcp_error": np.array(obs.tcp_error, dtype=np.float32),
+        "left_image": decode_img(obs.left_image),
+        "center_image": decode_img(obs.center_image),
+        "right_image": decode_img(obs.right_image),
+        "tcp_pos": np.array([cs.tcp_pose.position.x, cs.tcp_pose.position.y, cs.tcp_pose.position.z], dtype=np.float32),
+        "tcp_quat": np.array([cs.tcp_pose.orientation.x, cs.tcp_pose.orientation.y,
+                               cs.tcp_pose.orientation.z, cs.tcp_pose.orientation.w], dtype=np.float32),
+        "tcp_vel_lin": np.array([cs.tcp_velocity.linear.x, cs.tcp_velocity.linear.y, cs.tcp_velocity.linear.z], dtype=np.float32),
+        "tcp_vel_ang": np.array([cs.tcp_velocity.angular.x, cs.tcp_velocity.angular.y, cs.tcp_velocity.angular.z], dtype=np.float32),
+        "tcp_error": np.array(list(cs.tcp_error), dtype=np.float32),
         "joint_pos": np.array(obs.joint_states.position[:7], dtype=np.float32),
         "joint_vel": np.array(obs.joint_states.velocity[:7], dtype=np.float32),
-        "gripper_pos": np.float32(obs.joint_states.position[7]),
-        "wrench_force": np.array([obs.wrench.force.x, obs.wrench.force.y, obs.wrench.force.z], dtype=np.float32),
-        "wrench_torque": np.array([obs.wrench.torque.x, obs.wrench.torque.y, obs.wrench.torque.z], dtype=np.float32),
+        "gripper_pos": np.float32(obs.joint_states.position[6]),
+        "wrench_force": np.array([obs.wrist_wrench.wrench.force.x, obs.wrist_wrench.wrench.force.y, obs.wrist_wrench.wrench.force.z], dtype=np.float32),
+        "wrench_torque": np.array([obs.wrist_wrench.wrench.torque.x, obs.wrist_wrench.wrench.torque.y, obs.wrist_wrench.wrench.torque.z], dtype=np.float32),
     }
 
 
@@ -153,6 +158,9 @@ class TrainedPolicy(Policy):
         self._obs_window_image = cfg["data"]["obs_window_image"]
         self._obs_window_proprio = cfg["data"]["obs_window_proprio"]
         self._n_flow_steps = cfg["inference"]["n_flow_steps"]
+        mc = cfg["model"]
+        self._execute_steps = cfg["inference"].get("execute_steps", mc["action_chunk"])
+        self._n_tasks = mc.get("n_tasks", 2)
 
         approach_ckpt = parent_node.declare_parameter("approach_ckpt", "").value
         insert_ckpt = parent_node.declare_parameter("insert_ckpt", "").value
@@ -160,8 +168,8 @@ class TrainedPolicy(Policy):
         if not approach_ckpt or not insert_ckpt:
             raise ValueError("approach_ckpt and insert_ckpt ROS params must be set")
 
-        self.approach_model = _load_cfm_model(approach_ckpt, cfg, self.device)
-        self.insert_model = _load_cfm_model(insert_ckpt, cfg, self.device)
+        self.approach_model, self.approach_act_mean, self.approach_act_std = _load_cfm_model(approach_ckpt, cfg, self.device)
+        self.insert_model, self.insert_act_mean, self.insert_act_std = _load_cfm_model(insert_ckpt, cfg, self.device)
         self.get_logger().info(f"Loaded approach: {approach_ckpt}")
         self.get_logger().info(f"Loaded insert: {insert_ckpt}")
 
@@ -172,6 +180,19 @@ class TrainedPolicy(Policy):
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
+        # task_id: 0=SFP, 1=SC
+        task_id = torch.tensor(
+            [0 if "sfp" in task.plug_name.lower() else 1],
+            dtype=torch.long, device=self.device
+        )
+
+        max_steps = int(task.time_limit * CONTROL_HZ) if task.time_limit > 0 else MAX_STEPS
+        max_steps = min(max_steps, MAX_STEPS)
+        self.get_logger().info(
+            f"insert_cable: plug={task.plug_name} port={task.port_name} "
+            f"module={task.target_module_name} time_limit={task.time_limit}s max_steps={max_steps}"
+        )
+
         lookback = max(self._obs_window_image, self._obs_window_proprio)
         obs_buffer = []
 
@@ -182,13 +203,17 @@ class TrainedPolicy(Policy):
         step = 0
         action_queue = []  # remaining actions from last chunk
 
-        while step < MAX_STEPS:
+        while step < max_steps:
             if not action_queue:
-                model = self.approach_model if step < APPROACH_STEPS else self.insert_model
+                if step < APPROACH_STEPS:
+                    model, act_mean, act_std = self.approach_model, self.approach_act_mean, self.approach_act_std
+                else:
+                    model, act_mean, act_std = self.insert_model, self.insert_act_mean, self.insert_act_std
                 imgs, proprio, ft = _buffer_to_tensors(obs_buffer, self._obs_window_image, self._obs_window_proprio, self.device)
                 with torch.no_grad():
-                    pred = model.sample(imgs, proprio, ft, n_steps=self._n_flow_steps)
-                action_queue = pred[0].cpu().numpy().tolist()
+                    pred = model.sample(imgs, proprio, ft, task_id, n_steps=self._n_flow_steps)
+                    pred = pred * act_std + act_mean  # de-normalize
+                action_queue = pred[0].cpu().numpy().tolist()[:self._execute_steps]
 
             action = np.array(action_queue.pop(0))
             stamp = self._parent_node.get_clock().now().to_msg()
@@ -207,5 +232,5 @@ class TrainedPolicy(Policy):
                     send_feedback("Insertion complete")
                     return True
 
-        send_feedback("Max steps reached without insertion")
+        send_feedback(f"Max steps ({max_steps}) reached without insertion")
         return False
