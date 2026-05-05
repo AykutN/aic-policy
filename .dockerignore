@@ -1,1 +1,12 @@
+.git
 .pixi
+.pytest_cache
+.vscode
+**/.DS_Store
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+**/build
+**/install
+**/log

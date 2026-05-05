@@ -3,6 +3,11 @@ __pycache__/
 *.egg-info/
 build/
 files.txt
+.DS_Store
+**/.DS_Store
+
+# local model artifacts
+checkpoints/
 
 # pixi environments
 .pixi/*
@@ -15,4 +20,3 @@ aic_utils/aic_mujoco/mjcf/*.png
 
 # Ignore aic_isaac usd assets
 aic_utils/aic_isaac/aic_isaaclab/source/aic_task/aic_task/tasks/manager_based/aic_task/Intrinsic_assets/
-

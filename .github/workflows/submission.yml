@@ -1,0 +1,70 @@
+name: Build and Push Submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable image tag to push, for example cfm-001"
+        required: true
+        default: "cfm-001"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    env:
+      AWS_REGION: us-east-1
+      ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${ECR_REPOSITORY_URI}" || (echo "Missing ECR_REPOSITORY_URI secret" && exit 1)
+          test -n "${{ secrets.AWS_ACCESS_KEY_ID }}" || (echo "Missing AWS_ACCESS_KEY_ID secret" && exit 1)
+          test -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" || (echo "Missing AWS_SECRET_ACCESS_KEY secret" && exit 1)
+          test -n "${{ secrets.RCLONE_CONFIG_B64 }}" || (echo "Missing RCLONE_CONFIG_B64 secret" && exit 1)
+
+      - name: Download checkpoints from Google Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          mkdir -p checkpoints/cfm_subtask0 checkpoints/cfm_subtask1
+          echo "${{ secrets.RCLONE_CONFIG_B64 }}" | base64 -d > /tmp/rclone.conf
+          rclone --config /tmp/rclone.conf copyto gdrive:checkpoints/cfm_subtask0/best.pt checkpoints/cfm_subtask0/best.pt
+          rclone --config /tmp/rclone.conf copyto gdrive:checkpoints/cfm_subtask1/best.pt checkpoints/cfm_subtask1/best.pt
+          ls -lh checkpoints/cfm_subtask0/best.pt checkpoints/cfm_subtask1/best.pt
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "${AWS_REGION}" | \
+            docker login --username AWS --password-stdin 973918476471.dkr.ecr.us-east-1.amazonaws.com
+
+      - name: Build and push submission image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${ECR_REPOSITORY_URI}:${{ inputs.image_tag }}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file docker/aic_model/Dockerfile \
+            --tag "${IMAGE_URI}" \
+            --push \
+            .
+          echo "Pushed ${IMAGE_URI}"

@@ -2,6 +2,7 @@ name: aic
 services:
   eval:
     image: ghcr.io/intrinsic-dev/aic/aic_eval
+    platform: linux/amd64
     # image: my-eval:v1
     build:
       dockerfile: docker/aic_eval/Dockerfile
@@ -16,9 +17,11 @@ services:
       # AIC_ENABLE_ACL: true
   model:
     image: my-solution:v1
+    platform: linux/amd64
     build:
       dockerfile: docker/aic_model/Dockerfile
       context: ..
+    command: --ros-args -p use_sim_time:=true -p policy:=training.evaluate.TrainedPolicy -p approach_ckpt:=/ws_aic/src/aic/checkpoints/cfm_subtask0/best.pt -p insert_ckpt:=/ws_aic/src/aic/checkpoints/cfm_subtask1/best.pt
     gpus: all
     networks:
       - default

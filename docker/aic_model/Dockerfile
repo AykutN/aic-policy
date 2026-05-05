@@ -8,7 +8,11 @@ ENV PATH="/root/.pixi/bin:$PATH"
 COPY aic_example_policies /ws_aic/src/aic/aic_example_policies
 COPY aic_model /ws_aic/src/aic/aic_model
 COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
-COPY aic_utils /ws_aic/src/aic/aic_utils
+COPY aic_utils/aic_teleoperation /ws_aic/src/aic/aic_utils/aic_teleoperation
+COPY aic_utils/lerobot_robot_aic /ws_aic/src/aic/aic_utils/lerobot_robot_aic
+COPY aic_data_collector /ws_aic/src/aic/aic_data_collector
+COPY training /ws_aic/src/aic/training
+COPY checkpoints /ws_aic/src/aic/checkpoints
 COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
 
@@ -57,4 +61,4 @@ exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode"]
+CMD ["--ros-args", "-p", "use_sim_time:=true", "-p", "policy:=training.evaluate.TrainedPolicy", "-p", "approach_ckpt:=/ws_aic/src/aic/checkpoints/cfm_subtask0/best.pt", "-p", "insert_ckpt:=/ws_aic/src/aic/checkpoints/cfm_subtask1/best.pt"]
