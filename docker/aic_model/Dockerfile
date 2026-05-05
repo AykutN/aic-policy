@@ -4,23 +4,18 @@ FROM docker.io/library/ros:kilted-ros-core AS build
 RUN apt update && apt install -y git && curl -fsSL https://pixi.sh/install.sh | bash
 ENV PATH="/root/.pixi/bin:$PATH"
 
-# Add base dependencies
-COPY aic_example_policies /ws_aic/src/aic/aic_example_policies
+# Add the minimal runtime needed by the submission policy.
 COPY aic_model /ws_aic/src/aic/aic_model
 COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
-COPY aic_utils/aic_teleoperation /ws_aic/src/aic/aic_utils/aic_teleoperation
-COPY aic_utils/lerobot_robot_aic /ws_aic/src/aic/aic_utils/lerobot_robot_aic
-COPY aic_data_collector /ws_aic/src/aic/aic_data_collector
 COPY training /ws_aic/src/aic/training
 COPY checkpoints /ws_aic/src/aic/checkpoints
-COPY pixi.toml pixi.lock /ws_aic/src/aic/
+COPY docker/aic_model/pixi.toml /ws_aic/src/aic/pixi.toml
+COPY robostack_mapping.json /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
-
-# Add other dependencies
 
 SHELL ["/bin/bash", "-c"]
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
-    cd /ws_aic/src/aic && pixi install --locked
+    cd /ws_aic/src/aic && pixi install
 
 WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh

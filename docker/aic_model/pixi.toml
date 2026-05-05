@@ -1,0 +1,33 @@
+[workspace]
+name = "aic-submission"
+channels = ["robostack-kilted", "conda-forge"]
+platforms = ["linux-64"]
+version = "0.1.0"
+conda-pypi-map = { "robostack-kilted" = "robostack_mapping.json" }
+preview = ["pixi-build"]
+
+[dependencies]
+numpy = "*"
+pyyaml = "*"
+python = "3.12.*"
+ros-kilted-aic-control-interfaces = { path = "aic_interfaces/aic_control_interfaces" }
+ros-kilted-aic-model = { path = "aic_model" }
+ros-kilted-aic-model-interfaces = { path = "aic_interfaces/aic_model_interfaces" }
+ros-kilted-aic-task-interfaces = { path = "aic_interfaces/aic_task_interfaces" }
+ros-kilted-geometry-msgs = "*"
+ros-kilted-rclpy = "*"
+ros-kilted-rmw-zenoh-cpp = "*"
+ros-kilted-ros-core = "*"
+ros-kilted-sensor-msgs = "*"
+ros-kilted-std-msgs = "*"
+ros-kilted-std-srvs = "*"
+ros-kilted-tf2-ros-py = "*"
+ros-kilted-trajectory-msgs = "*"
+
+[pypi-dependencies]
+opencv-python-headless = "<4.13"
+torch = "==2.7.1"
+torchvision = "==0.22.1"
+
+[activation]
+scripts = ["pixi_env_setup.sh"]

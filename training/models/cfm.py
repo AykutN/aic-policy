@@ -86,12 +86,13 @@ class CFMPolicy(nn.Module):
         action_chunk: int = 32,
         n_tasks: int = 2,
         task_emb_dim: int = 32,
+        image_pretrained: bool = True,
     ):
         super().__init__()
         self.action_chunk = action_chunk
         self.action_dim = action_dim
 
-        self.img_enc = ImageEncoder(feature_dim=image_feature_dim)
+        self.img_enc = ImageEncoder(feature_dim=image_feature_dim, pretrained=image_pretrained)
         self.ft_enc = FTEncoder(feature_dim=ft_feature_dim)
         self.prop_enc = ProprioEncoder(feature_dim=proprio_feature_dim)
         self.task_emb = nn.Embedding(n_tasks, task_emb_dim)

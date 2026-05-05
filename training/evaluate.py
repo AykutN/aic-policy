@@ -51,6 +51,7 @@ def _load_cfm_model(ckpt_path: str, cfg: dict, device):
         action_chunk=mc["action_chunk"],
         n_tasks=mc.get("n_tasks", 2),
         task_emb_dim=mc.get("task_emb_dim", 32),
+        image_pretrained=False,
     ).to(device)
     ckpt = torch.load(ckpt_path, map_location=device)
     state_key = "ema_state" if "ema_state" in ckpt else "model_state"
