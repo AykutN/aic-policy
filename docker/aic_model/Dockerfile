@@ -24,8 +24,9 @@ set -e
 
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 
-if [[ -z "$AIC_ROUTER_ADDR" ]]; then
-  echo "AIC_ROUTER_ADDR must be provided"
+ROUTER_ADDR="${AIC_MODEL_ROUTER_ADDR:-${AIC_ROUTER_ADDR:-}}"
+if [[ -z "$ROUTER_ADDR" ]]; then
+  echo "AIC_MODEL_ROUTER_ADDR must be provided"
   exit 1
 fi
 
@@ -43,7 +44,7 @@ if should_enable_acl; then
 fi
 
 # start the model
-ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"$AIC_ROUTER_ADDR"'"]'
+ZENOH_CONFIG_OVERRIDE='connect/endpoints=["tcp/'"$ROUTER_ADDR"'"]'
 ZENOH_CONFIG_OVERRIDE+=';transport/shared_memory/enabled=false'
 if should_enable_acl; then
   ZENOH_CONFIG_OVERRIDE+=';transport/auth/usrpwd/user="model"'
